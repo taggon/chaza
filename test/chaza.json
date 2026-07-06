@@ -1,0 +1,16 @@
+{
+  "schema": {
+    "indexed_fields": [
+      "title",
+      "body"
+    ],
+    "metadata_fields": [
+      "path"
+    ],
+    "url_field": "path"
+  },
+  "korean": {
+    "choseong_search": true,
+    "choseong_max_len": 3
+  }
+}

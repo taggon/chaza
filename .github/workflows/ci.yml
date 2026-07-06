@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build CLI
+        run: zig build
+
+      - name: Build test corpus
+        run: |
+          mkdir -p test-out
+          ./zig-out/bin/chaza build test/search_index.ko.json -o test-out/chaza.wasm --config test/chaza.json --no-js
+
+      - name: Verify bundle
+        run: |
+          test -f test-out/chaza.wasm
+          SIZE=$(stat -c%s test-out/chaza.wasm)
+          echo "Bundle size: $SIZE bytes"
+          if [ "$SIZE" -lt 100000 ] || [ "$SIZE" -gt 1000000 ]; then
+            echo "Unexpected bundle size"
+            exit 1
+          fi

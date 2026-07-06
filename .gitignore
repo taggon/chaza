@@ -1,0 +1,6 @@
+.DS-store
+.DS_Store
+.zig-cache
+zig-out
+dist
+test-out

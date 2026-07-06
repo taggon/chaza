@@ -1,0 +1,15 @@
+{
+  "name": "chaza",
+  "version": "",
+  "description": "",
+  "main": "chaza.js",
+  "exports": {
+    ".": "./chaza.js",
+    "./loader": "./loader.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taggon/chaza.git"
+  },
+  "license": "MIT"
+}
