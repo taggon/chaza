@@ -2,58 +2,56 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Cross-compile all targets, output standalone binaries to dist/.
+# Binary names match install.sh expectations: chaza-{os}-{arch}[.exe]
+
 TARGETS=(
-    "x86_64-linux-gnu"
-    "x86_64-macos-none"
-    "aarch64-linux-gnu"
-    "aarch64-macos-none"
-    "x86_64-windows-gnu"
-    "aarch64-windows-gnu"
+  "aarch64-macos:darwin-arm64"
+  "x86_64-macos:darwin-x64"
+  "aarch64-linux:linux-arm64"
+  "x86_64-linux:linux-x64"
+  "x86_64-windows:win32-x64"
 )
 
+rm -rf dist
 mkdir -p dist
 
-# Detect stat flavor (BSD vs GNU)
 filesize() {
-    stat -f%z "$1" 2>/dev/null || stat -c%s "$1"
+  stat -f%z "$1" 2>/dev/null || stat -c%s "$1"
 }
 
 FAILED=()
 
-for target in "${TARGETS[@]}"; do
-    echo "→ Building $target..."
-    if ! zig build -Dtarget="$target" -Doptimize=ReleaseSafe 2>&1; then
-        echo "  ERROR: build failed for $target"
-        FAILED+=("$target")
-        continue
-    fi
+for entry in "${TARGETS[@]}"; do
+  zig_target="${entry%%:*}"
+  npm_platform="${entry##*:}"
 
-    if [[ "$target" == *windows* ]]; then
-        bin="zig-out/bin/chaza.exe"
-        out="dist/chaza-$target.exe"
-    else
-        bin="zig-out/bin/chaza"
-        out="dist/chaza-$target"
-    fi
+  echo "→ Building $zig_target..."
+  if ! zig build -Dtarget="$zig_target" -Doptimize=ReleaseFast 2>&1; then
+    echo "  ERROR: build failed"
+    FAILED+=("$npm_platform")
+    continue
+  fi
 
-    if [[ -f "$bin" ]]; then
-        mv "$bin" "$out"
-        echo "  → $out ($(filesize "$out") bytes)"
-    else
-        echo "  ERROR: $bin not found"
-        FAILED+=("$target")
-        continue
-    fi
+  if [[ "$npm_platform" == win32-* ]]; then
+    cp zig-out/bin/chaza.exe "dist/chaza-${npm_platform}.exe"
+  else
+    cp zig-out/bin/chaza "dist/chaza-${npm_platform}"
+    chmod +x "dist/chaza-${npm_platform}"
+  fi
+
+  out="dist/chaza-${npm_platform}"
+  [[ "$npm_platform" == win32-* ]] && out="${out}.exe"
+  echo "  ✓ ${out} ($(filesize "$out") bytes)"
 done
 
 echo ""
-echo "Cross-compile matrix complete:"
-ls -la dist/
+echo "Release binaries ready in dist/:"
+ls -lh dist/
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then
-    echo ""
-    echo "FAILED targets:"
-    for t in "${FAILED[@]}"; do
-        echo "  - $t"
-    done
+  echo ""
+  echo "FAILED:"
+  for t in "${FAILED[@]}"; do echo "  - chaza-$t"; done
+  exit 1
 fi

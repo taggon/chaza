@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
         \\pub const loader_js: []const u8 = @embedFile("chaza.js");
     );
     _ = embed_files.addCopyFile(runtime_exe.getEmittedBin(), "runtime.wasm");
-    _ = embed_files.addCopyFile(b.path("loader/chaza.js"), "chaza.js");
+    _ = embed_files.addCopyFile(b.path("npm/chaza/dist/chaza.js"), "chaza.js");
 
     const embeds_mod = b.createModule(.{
         .root_source_file = embed_files.getDirectory().path(b, "embeds.zig"),

@@ -102,7 +102,7 @@ examples/                  샘플 corpus.json + chaza.json + 데모 HTML
 
 1. **runtime wasm** — `wasm32-freestanding`, `ReleaseSmall`, `export` 심볼 노출. 산출물 `runtime.wasm`.
 2. **loader JS** — `loader/chaza.js` 소스 (필요시 `loader/build.mjs`로 최소화).
-3. **chaza CLI native exe** — 크로스컴파일 가능(`-Dtarget`). `runtime.wasm`과 `chaza_loader.js` 양쪽을 `@embedFile`로 포함.
+3. **chaza CLI native exe** — 크로스컴파일 가능(`-Dtarget`). `runtime.wasm`과 `chaza.js` 양쪽을 `@embedFile`로 포함.
 
 크로스컴파일은 `b.standardTargetOptions(.{})` 기본값으로 열어두면 `zig build -Dtarget=x86_64-linux-gnu` 식으로 동작. CI 매트릭스는 8단계에서 추가.
 

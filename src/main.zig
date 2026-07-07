@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     const corpus_path = args[2];
 
     // 기본값
-    var output_path: []const u8 = "chaza.wasm";
+    var output_path: []const u8 = "chaza.bundle";
     var config_path: ?[]const u8 = null;
     var stopwords_path: ?[]const u8 = null;
     var no_choseong = false;
@@ -210,7 +210,7 @@ fn printUsage() void {
         \\Usage: chaza build <corpus.json> [options]
         \\
         \\Options:
-        \\  -o, --output <path>      Output bundle path (default: chaza.wasm)
+        \\  -o, --output <path>      Output bundle path (default: chaza.bundle)
         \\  --config <path>          Path to chaza.json config file
         \\  --stopwords <path>       Stopwords file (line-separated)
         \\  --no-choseong            Disable choseong search

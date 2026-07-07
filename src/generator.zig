@@ -45,7 +45,7 @@ pub fn generate(
     defer arena.deinit();
     const a = arena.allocator();
 
-    // 1. JSON 파싱
+    // 1. Parse JSON
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, corpus_json, .{});
     defer parsed.deinit();
 

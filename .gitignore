@@ -1,6 +1,9 @@
-.DS-store
 .DS_Store
-.zig-cache
-zig-out
-dist
-test-out
+.zig-cache/
+zig-out/
+dist/
+test-out/
+npm/@chaza/
+npm/chaza/dist/
+npm/chaza/node_modules/
+node_modules/
