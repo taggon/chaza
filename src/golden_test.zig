@@ -142,6 +142,25 @@ test "golden determinism: stopword added → different index bytes" {
     try std.testing.expect(!std.mem.eql(u8, v_sw.index, v_no.index));
 }
 
+// ── A2. Golden bytes hash regression ──
+
+/// xxhash64 of the golden corpus index bytes, pinned at commit time.
+/// The determinism tests above only compare two runs of the same build —
+/// this constant catches unintended output drift BETWEEN commits
+/// (format, tokenization, prefix/choseong generation, filter construction).
+/// Update only for intentional pipeline/format changes.
+const GOLDEN_INDEX_XXH64: u64 = 0x3474f037bf512abf;
+
+test "golden hash: index bytes match pinned xxhash64" {
+    const allocator = std.testing.allocator;
+    const result = try buildGolden(allocator);
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    const h = std.hash.XxHash64.hash(0, view.index);
+    try std.testing.expectEqual(GOLDEN_INDEX_XXH64, h);
+}
+
 // ── B. Build-query tokenization consistency ──
 
 test "golden consistency: all indexed tokens exist in corresponding document filter" {
