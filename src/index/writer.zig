@@ -1,10 +1,10 @@
-//! chaza 인덱스 직렬화 (writer) — SPEC v1.2.
+//! chaza index serialization (writer).
 //!
-//! IndexInput를 받아 평면 바이너리 포맷으로 직렬화.
-//! 2패스: 1패스에서 구역별 크기·오프셋 산출, 2패스에서 실제 바이트 기록.
+//! Serialize IndexInput to flat binary format.
+//! 2-pass: 1-pass calculates section sizes·offsets, 2-pass writes actual bytes.
 //!
-//! v1.2: BinaryFuse8 필터 사용. 토큰 → key64 → u64 키 → fuse blob 직렬화.
-//! string_pool에는 title / url / 메타 값만 들어감.
+//! v1.2: BinaryFuse8 filter. token → key64 → u64 key → fuse blob serialization.
+//! string_pool contains only title / url / meta values.
 
 const std = @import("std");
 const format = @import("format.zig");
@@ -16,24 +16,24 @@ const Header = format.Header;
 const DocEntryPrefix = format.DocEntryPrefix;
 const MetaEntry = format.MetaEntry;
 
-/// 단일 문서 입력.
+/// Single document input.
 pub const DocInput = struct {
-    /// 토큰화·불용어 제거를 거친 고유 토큰 집합 (필터 빌드용, 직렬화 안 함).
+    /// Unique token set after tokenization·stopword removal (for filter build, not serialized).
     tokens: []const []const u8,
-    /// 결과 표시용 제목.
+    /// Title for result display.
     title: []const u8,
-    /// 결과 이동용 URL.
+    /// URL for result navigation.
     url: []const u8,
-    /// num_meta_fields 개의 메타 값 (사용자 정의 필드, title/url 제외).
+    /// Meta values count = num_meta_fields (user-defined fields, title/url excluded).
     meta_values: []const []const u8,
 };
 
-/// 인덱스 전체 입력.
+/// Entire index input.
 pub const IndexInput = struct {
-    /// 사용자 metadata_fields 이름 (title/url 제외).
+    /// User metadata_fields names (title/url excluded).
     meta_field_names: []const []const u8,
     docs: []const DocInput,
-    /// 초성 토큰 추가 길이 (0이면 비활성).
+    /// Choseong token addition length (0 = disabled).
     choseong_max_len: u8 = 0,
 };
 

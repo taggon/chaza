@@ -1,9 +1,9 @@
-//! chaza 인덱스 판독기: 직렬화된 인덱스 바이트를 zero-parse 슬라이스 뷰로 노출.
+//! chaza index reader: zero-parse slice view of serialized index bytes.
 //!
-//! IndexView는 인덱스 바이트를 소유하지 않는다 — caller가 버퍼 수명 관리.
-//! 모든 오프셋은 헤더 기준이며, 각 접근자는 슬라이스 범위를 검증한다.
-//! DocEntryPrefix의 filter_off는 filters 구역 기준.
-//! title_off / url_off / MetaEntry.off는 string_pool 기준.
+//! IndexView doesn't own index bytes — caller manages buffer lifetime.
+//! All offsets header-relative, each accessor validates slice bounds.
+//! DocEntryPrefix.filter_off is filters section-relative.
+//! title_off / url_off / MetaEntry.off are string_pool-relative.
 
 const std = @import("std");
 const fmt = @import("format.zig");
@@ -15,30 +15,30 @@ pub const MAGIC = fmt.MAGIC;
 pub const VERSION = fmt.VERSION;
 pub const HEADER_SIZE = fmt.HEADER_SIZE;
 
-/// 인덱스 열기 실패 원인.
+/// Index open failure reasons.
 pub const OpenError = error{
     InvalidMagic,
     InvalidVersion,
     Truncated,
 };
 
-/// 직렬화된 인덱스 바이트에 대한 zero-parse 뷰.
-/// `bytes`는 caller 소유 — IndexView보다 오래 살아야 한다.
-/// 모든 슬라이스 필드는 `bytes` 내부를 가리킨다.
+/// zero-parse view of serialized index bytes.
+/// `bytes` caller-owned — must outlive IndexView.
+/// All slice fields point inside `bytes`.
 pub const IndexView = struct {
     bytes: []const u8,
     header: *const Header,
-    /// 메타 필드 이름 목록 원시 바이트 (NUL 종료 문자열들).
+    /// Meta field name list raw bytes (NUL-terminated strings).
     meta_names: []const u8,
-    /// 문서 메타 테이블 원시 바이트.
+    /// Document metadata table raw bytes.
     doc_table: []const u8,
-    /// 문자열 풀 (title / url / 메타 값).
+    /// String pool (title / url / meta values).
     string_pool: []const u8,
-    /// 필터 데이터 (필터 blob).
+    /// Filter data (filter blobs).
     filters: []const u8,
 
-    /// 인덱스 바이트를 뷰로 열기.
-    /// 헤더 매직/버전 검증 + 각 구역 오프셋이 bytes 범위 내인지 확인.
+    /// Open index bytes as view.
+    /// Validate header magic/version + verify each section offset within bytes bounds.
     pub fn open(bytes: []const u8) OpenError!IndexView {
         if (bytes.len < HEADER_SIZE) return error.Truncated;
 
@@ -52,7 +52,7 @@ pub const IndexView = struct {
         const filt_off = header.filters_off;
         const len: usize = bytes.len;
 
-        // 각 오프셋이 단조 증가하며 bytes 범위 내인지 검증.
+        // Verify each offset non-decreasing and within bytes bounds
         if (names_off > len or doc_off > len or pool_off > len or filt_off > len) return error.Truncated;
         if (!(names_off <= doc_off and doc_off <= pool_off and pool_off <= filt_off)) return error.Truncated;
 
@@ -66,12 +66,12 @@ pub const IndexView = struct {
         };
     }
 
-    /// 한 DocEntry의 바이트 stride = 24 + 8 * num_meta_fields.
+    /// One DocEntry byte stride = 24 + 8 * num_meta_fields.
     inline fn docStride(self: IndexView) usize {
         return fmt.docEntrySize(self.header.num_meta_fields);
     }
 
-    /// 문서 id로 DocEntryPrefix 포인터. doc_id >= num_docs 또는 범위 초과면 null.
+    /// DocEntryPrefix pointer by document id. null if doc_id >= num_docs or out of bounds.
     pub fn docEntry(self: IndexView, doc_id: u32) ?*const DocEntryPrefix {
         if (doc_id >= self.header.num_docs) return null;
         const base: usize = self.header.doc_table_off;
@@ -82,8 +82,8 @@ pub const IndexView = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    /// 해당 문서의 메타 엔트리 슬라이스. 범위 초과면 null.
-    /// field_idx는 사용자 metadata_fields 인덱스 (title/url과 무관).
+    /// Document's meta entry slice. null if out of bounds.
+    /// field_idx is user metadata_fields index (unrelated to title/url).
     pub fn docMetaEntries(self: IndexView, doc_id: u32) ?[]const MetaEntry {
         const prefix = self.docEntry(doc_id) orelse return null;
         const nmf: usize = self.header.num_meta_fields;
@@ -97,7 +97,7 @@ pub const IndexView = struct {
         return meta_ptr[0..nmf];
     }
 
-    /// 문서 제목 (string_pool 내). doc_id 범위 초과면 null.
+    /// Document title (within string_pool). null if doc_id out of bounds.
     pub fn title(self: IndexView, doc_id: u32) ?[]const u8 {
         const prefix = self.docEntry(doc_id) orelse return null;
         const off: usize = prefix.title_off;
@@ -106,7 +106,7 @@ pub const IndexView = struct {
         return self.string_pool[off .. off + ln];
     }
 
-    /// 문서 URL (string_pool 내). doc_id 범위 초과면 null.
+    /// Document URL (within string_pool). null if doc_id out of bounds.
     pub fn url(self: IndexView, doc_id: u32) ?[]const u8 {
         const prefix = self.docEntry(doc_id) orelse return null;
         const off: usize = prefix.url_off;
@@ -115,7 +115,7 @@ pub const IndexView = struct {
         return self.string_pool[off .. off + ln];
     }
 
-    /// 필터 blob 슬라이스 (filters 구역 내).
+    /// Filter blob slice (within filters section).
     pub fn docFilter(self: IndexView, doc_id: u32) ?[]const u8 {
         const prefix = self.docEntry(doc_id) orelse return null;
         const off: usize = prefix.filter_off;
@@ -124,8 +124,8 @@ pub const IndexView = struct {
         return self.filters[off .. off + ln];
     }
 
-    /// 특정 메타 필드 값 (string_pool 내). field_idx 초과면 null.
-    /// field_idx는 사용자 metadata_fields 인덱스 (title/url과 무관).
+    /// Specific meta field value (within string_pool). null if doc_id or field_idx is out of bounds.
+    /// field_idx is user metadata_fields index (unrelated to title/url).
     pub fn metaValue(self: IndexView, doc_id: u32, field_idx: usize) ?[]const u8 {
         const metas = self.docMetaEntries(doc_id) orelse return null;
         if (field_idx >= metas.len) return null;
@@ -136,8 +136,8 @@ pub const IndexView = struct {
         return self.string_pool[off .. off + ln];
     }
 
-    /// 메타 필드 이름 (idx번째 NUL 종료 문자열). 범위 초과면 null.
-    /// num_meta_fields로 상한 검사 — 정렬 패딩 zero를 빈 문자열로 오인 방지.
+    /// Meta field name (idx-th NUL-terminated string). null if out of bounds.
+    /// Upper bound checked by num_meta_fields — prevents misinterpreting zero padding as empty string.
     pub fn metaNameAt(self: IndexView, idx: usize) ?[]const u8 {
         if (idx >= self.header.num_meta_fields) return null;
         const region = self.meta_names;
@@ -146,30 +146,30 @@ pub const IndexView = struct {
         while (i < region.len) {
             const start = i;
             while (i < region.len and region[i] != 0) : (i += 1) {}
-            if (i >= region.len) return null; // NUL 종료 부재 → 손상
+            if (i >= region.len) return null; // NUL termination missing → corrupted
             if (count == idx) return region[start..i];
             count += 1;
-            i += 1; // NUL 건너뜀
+            i += 1; // skip NUL
         }
         return null;
     }
 };
 
-// ── 단정 테스트 ────────────────────────────────────────────────────
+// ── Assertion tests ────────────────────────────────────────────────────
 //
-// SPEC v1.1 핸드코딩 fixture (96바이트):
+// Hand-coded fixture (96 bytes):
 //
-//   오프셋  구역                내용
+//   Offset   Section             Content
 //   ─────────────────────────────────────────────────────
-//   0       Header (32B)        magic / version / offsets
-//   32      meta_names (8B)     "date\0" + 3B 패딩 (align4)
-//   40      doc_table (32B)     DocEntryPrefix(24B) + MetaEntry(8B)
-//   72      string_pool (16B)   "Hi"(2) + "/a"(2) + "2026-01-01"(10) + 2B 패딩
-//   88      filters (8B)        0xAA 0xBB 0xCC 0xDD 0xEE 0xFF 0x11 0x22
+//   0        Header (32B)        magic / version / offsets
+//   32       meta_names (8B)     "date\0" + 3B padding (align4)
+//   40       doc_table (32B)     DocEntryPrefix(24B) + MetaEntry(8B)
+//   72       string_pool (16B)   "Hi"(2) + "/a"(2) + "2026-01-01"(10) + 2B padding
+//   88       filters (8B)        0xAA 0xBB 0xCC 0xDD 0xEE 0xFF 0x11 0x22
 //   ─────────────────────────────────────────────────────
-//   총 96바이트
+//   Total 96 bytes
 //
-// string_pool 상대 오프셋:
+// string_pool relative offsets:
 //   title  → off=0,  len=2  ("Hi")
 //   url    → off=2,  len=2  ("/a")
 //   meta   → off=4,  len=10 ("2026-01-01")
@@ -193,7 +193,7 @@ const POOL_OFF = DOC_OFF + DOC_STRIDE; // 72
 const FILT_OFF = POOL_OFF + POOL_SIZE; // 88
 const TOTAL = FILT_OFF + FILTERS_SIZE; // 96
 
-/// 작은 인덱스(메타 1개, 문서 1개) 바이트를 리틀엔디안으로 직접 구성.
+/// Directly construct small index (1 meta, 1 doc) bytes in little-endian.
 fn buildTinyIndex() [TOTAL]u8 {
     var buf: [TOTAL]u8 = [_]u8{0} ** TOTAL;
 
@@ -210,11 +210,11 @@ fn buildTinyIndex() [TOTAL]u8 {
     std.mem.writeInt(u32, buf[24..28], POOL_OFF, .little);
     std.mem.writeInt(u32, buf[28..32], FILT_OFF, .little);
 
-    // 메타 필드 이름 "date\0" + 패딩
+    // Meta field name "date\0" + padding
     @memcpy(buf[NAMES_OFF..][0..meta_name.len], meta_name);
     buf[NAMES_OFF + meta_name.len] = 0;
 
-    // DocEntryPrefix (24B) — v1.1: filter / title / url
+    // DocEntryPrefix (24B) — filter / title / url
     const dep = DOC_OFF;
     std.mem.writeInt(u32, buf[dep..][0..4], 0, .little); // filter_off
     std.mem.writeInt(u32, buf[dep + 4 ..][0..4], filter_bits.len, .little); // filter_len
@@ -223,12 +223,12 @@ fn buildTinyIndex() [TOTAL]u8 {
     std.mem.writeInt(u32, buf[dep + 16 ..][0..4], title_str.len, .little); // url_off
     std.mem.writeInt(u32, buf[dep + 20 ..][0..4], url_str.len, .little); // url_len
 
-    // MetaEntry (8B) — meta 값은 title+url 뒤
+    // MetaEntry (8B) — meta value after title+url
     const me = dep + @sizeOf(DocEntryPrefix);
     std.mem.writeInt(u32, buf[me..][0..4], title_str.len + url_str.len, .little); // off
     std.mem.writeInt(u32, buf[me + 4 ..][0..4], meta_val.len, .little); // len
 
-    // 문자열 풀: title + url + meta 값
+    // String pool: title + url + meta value
     var sp: usize = POOL_OFF;
     @memcpy(buf[sp..][0..title_str.len], title_str);
     sp += title_str.len;
@@ -236,30 +236,30 @@ fn buildTinyIndex() [TOTAL]u8 {
     sp += url_str.len;
     @memcpy(buf[sp..][0..meta_val.len], meta_val);
 
-    // 필터 비트
+    // Filter bits
     @memcpy(buf[FILT_OFF..][0..filter_bits.len], &filter_bits);
 
     return buf;
 }
 
-test "open: Truncated — bytes가 HEADER_SIZE 미만" {
+test "open: Truncated — bytes < HEADER_SIZE" {
     const tiny: [4]u8 = .{ 0, 0, 0, 0 };
     try std.testing.expectError(error.Truncated, IndexView.open(&tiny));
 }
 
 test "open: InvalidMagic" {
     var buf: [TOTAL]u8 align(4) = buildTinyIndex();
-    buf[0] = 0x00; // 매직 첫 바이트 훼손
+    buf[0] = 0x00; // corrupt magic first byte
     try std.testing.expectError(error.InvalidMagic, IndexView.open(&buf));
 }
 
 test "open: InvalidVersion" {
     var buf: [TOTAL]u8 align(4) = buildTinyIndex();
-    buf[4] = 99; // 지원 않는 버전
+    buf[4] = 99; // unsupported version
     try std.testing.expectError(error.InvalidVersion, IndexView.open(&buf));
 }
 
-test "open: 정상 — 헤더 필드 읽기" {
+test "open: normal — read header fields" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     try std.testing.expectEqual(MAGIC, v.header.magic);
@@ -269,7 +269,7 @@ test "open: 정상 — 헤더 필드 읽기" {
     try std.testing.expectEqual(@as(u8, 0), v.header.hash_k);
 }
 
-test "open: 구역 슬라이스 길이 일치" {
+test "open: section slice lengths match" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     try std.testing.expectEqual(NAMES_SIZE, v.meta_names.len);
@@ -278,7 +278,7 @@ test "open: 구역 슬라이스 길이 일치" {
     try std.testing.expectEqual(FILTERS_SIZE, v.filters.len);
 }
 
-test "docEntry(0): DocEntryPrefix title/url 필드" {
+test "docEntry(0): DocEntryPrefix title/url fields" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const e = v.docEntry(0) orelse return error.UnexpectedNull;
@@ -290,21 +290,21 @@ test "docEntry(0): DocEntryPrefix title/url 필드" {
     try std.testing.expectEqual(@as(u32, url_str.len), e.url_len);
 }
 
-test "title(0): 예상 제목 문자열" {
+test "title(0): expected title string" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const t = v.title(0) orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings(title_str, t);
 }
 
-test "url(0): 예상 URL 문자열" {
+test "url(0): expected URL string" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const u = v.url(0) orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings(url_str, u);
 }
 
-test "docMetaEntries(0): 슬라이스 길이 1" {
+test "docMetaEntries(0): slice length 1" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const metas = v.docMetaEntries(0) orelse return error.UnexpectedNull;
@@ -313,28 +313,28 @@ test "docMetaEntries(0): 슬라이스 길이 1" {
     try std.testing.expectEqual(@as(u32, meta_val.len), metas[0].len);
 }
 
-test "metaValue(0, 0): 예상 메타 값" {
+test "metaValue(0, 0): expected meta value" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const mv = v.metaValue(0, 0) orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings(meta_val, mv);
 }
 
-test "docFilter(0): 예상 비트 배열" {
+test "docFilter(0): expected bit array" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const f = v.docFilter(0) orelse return error.UnexpectedNull;
     try std.testing.expectEqualSlices(u8, &filter_bits, f);
 }
 
-test "metaNameAt(0): 예상 필드 이름" {
+test "metaNameAt(0): expected field name" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     const name = v.metaNameAt(0) orelse return error.UnexpectedNull;
     try std.testing.expectEqualStrings(meta_name, name);
 }
 
-test "범위 초과 doc_id → null (docEntry, title, url, docMetaEntries, metaValue)" {
+test "out of bounds doc_id → null (docEntry, title, url, docMetaEntries, metaValue)" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     try std.testing.expect(v.docEntry(1) == null);
@@ -349,23 +349,23 @@ test "범위 초과 doc_id → null (docEntry, title, url, docMetaEntries, metaV
     try std.testing.expect(v.metaValue(999, 0) == null);
 }
 
-test "metaValue: field_idx 초과 → null" {
+test "metaValue: field_idx out of bounds → null" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     try std.testing.expect(v.metaValue(0, 1) == null);
     try std.testing.expect(v.metaValue(0, 99) == null);
 }
 
-test "metaNameAt: idx 초과 → null" {
+test "metaNameAt: idx out of bounds → null" {
     const buf: [TOTAL]u8 align(4) = buildTinyIndex();
     const v = try IndexView.open(&buf);
     try std.testing.expect(v.metaNameAt(1) == null);
     try std.testing.expect(v.metaNameAt(99) == null);
 }
 
-test "open: 오프셋 역전 → Truncated" {
+test "open: offset reversal → Truncated" {
     var buf: [TOTAL]u8 align(4) = buildTinyIndex();
-    // doc_table_off를 pool_off보다 크게 만들어 역전 유발
+    // Make doc_table_off larger than pool_off to cause reversal
     std.mem.writeInt(u32, buf[20..24], POOL_OFF + 1, .little);
     try std.testing.expectError(error.Truncated, IndexView.open(&buf));
 }

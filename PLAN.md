@@ -2,6 +2,17 @@
 
 > SPEC.md v1.2를 구현하기 위한 작업 계획. 리스크가 큰 부분을 먼저 검증하는 SPEC의 권장 순서를 따르되, 모듈 경계를 미리 정해 두어 1~8단계 전체가 일관된 구조 안에서 진행되도록 한다.
 
+## v1.3에서 바뀐 점 (v1.2 대비) — 구현 완료 후 적용된 변경
+
+- **검색: AND 고정 → OR + hit 수 랭킹.** 토큰이 하나라도 hit인 문서가 후보, hit 토큰 수 내림차순(동점은 입력 순). AND 매치가 자연히 최상위. 일부 검색어가 불용어여도 나머지 토큰으로 결과가 나옴.
+- **메타 필드 정렬 제거.** `search()` 시그니처가 `(query_ptr, query_len, max_results)`로 축소. `sort_field_idx`/`sort_desc` 삭제. 메타 정렬은 JS에서 결과 후처리로 대체. 메타 필드 자체(저장/표시)는 유지.
+- **불용어 동작 명시.** 불용어 목록은 번들에 미포함 → 런타임이 쿼리에서 제거 불가 → 불용어는 어떤 문서와도 매치 안 됨. 전부 불용어인 쿼리는 결과 0. README에 명시.
+- **결과에 `hits` 노출.** 반환 버퍼 `[u32 count][(u32 doc_id, u32 hits) × count]`. JS `SearchResult.hits` = 매치 토큰 수.
+- **쿼리 토큰 상한 16.** 17번째 이후 토큰 무시 → hits 범위 0~16. OR 오탐 누적(토큰당 문서 ~0.4%)과 조회 비용 상한.
+- **Bloom 폴백·`--fp-rate` 미구현 확정.** fuse가 Bloom을 크기·속도·오탐 모두 흡수 — 폴백 유지 이유 없음. `filter_kind`는 미래 확장용 포맷 예약으로만 잔존 (format.zig 주석 참조). 본문의 `bloom.zig`·`--fp-rate` 서술은 v1.2 계획 당시 기준.
+- **prefix 검색 (search-as-you-type).** `prefix_fields`(기본 `["title"]`, `indexed_fields` 부분집합 강제) 단어에 edge n-gram prefix 토큰(2~8 코드포인트, 마커 `\x02`, 진부분 prefix만) 색인 — `pipeline/prefix.zig`. 쿼리 마지막 토큰만 exact + prefix 병행 조회. body 제외라 비용 문서당 수십 바이트. 포맷 변경 없음.
+- 아래 본문의 "AND 고정"·`sort_field_idx`·반환 포맷 관련 서술은 v1.2 당시 기준 — SPEC.md v1.3이 우선.
+
 ## v1.2에서 바뀐 점 (v1.1 대비)
 
 - **필터 기본을 binary fuse filter (BinaryFuse8)로 확정**. Bloom은 디버깅/폴백, xor는 대체 (`filter_kind`).

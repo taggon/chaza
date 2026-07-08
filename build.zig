@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── runtime wasm: wasm32-freestanding, ReleaseSmall ──
-    // export_symbol_names가 설정되어 있어 ReleaseSmall의 lazy DCE에서
-    // export 심볼이 보존됨 (없으면 -fno-entry 결합 시 심볼이 날아감).
+    // Since export_symbol_names is configured, export symbols are preserved
+    // during ReleaseSmall's lazy DCE (otherwise they disappear with -fno-entry).
     const runtime_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -36,9 +36,9 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_runtime.step);
 
     // ── chaza CLI executable ──
-    // runtime.wasm과 chaza.js를 @embedFile로 주입하기 위한 임베드 모듈 생성.
-    // WriteFile 단계가 캐시 디렉터리에 파일들을 복사하고, 그 디렉터리를
-    // 익명 모듈의 루트로 지정. main.zig는 @import("chaza_embeds")로 접근.
+    // Create embed module to inject runtime.wasm and chaza.js via @embedFile.
+    // WriteFile step copies files to cache directory, then designates that
+    // directory as anonymous module root. main.zig accesses via @import("chaza_embeds").
     const embed_files = b.addWriteFiles();
     _ = embed_files.add("embeds.zig",
         \\pub const runtime_wasm: []const u8 = @embedFile("runtime.wasm");

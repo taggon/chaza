@@ -1,27 +1,40 @@
-//! Binary Fuse Filter (BinaryFuse8) — pure Zig 구현.
+//! Binary Fuse Filter (BinaryFuse8) — pure Zig implementation.
 //!
-//! fastfilter `binaryfusefilter.h` (Thomas Mueller Graf, Daniel Lemire)의
-//! C 참조 구현을 Zig로 포팅. 구성(populate)과 조회(contain)가 동일한
-//! Zig 해시 코드를 공유 → C↔Zig 비트 불일치 위험 원천 제거.
+//! Zig port of C reference implementation from fastfilter `binaryfusefilter.h`
+//! (Thomas Mueller Graf, Daniel Lemire). Shares identical Zig hash code for
+//! population and lookup then eliminates C↔Zig bit mismatch risk.
 //!
-//! 8비트 지문 사용. 오탐률 ≈ 1/256 (0.4%). 조회 고정 3회.
+//! 8-bit fingerprint. False positive rate ≈ 1/256 (0.4%). Fixed 3 lookups.
 //!
-//! 두 층의 해시:
-//!   ① chaza 레벨: 토큰 → xxhash64 → u64 키 (hash.zig key64)
-//!   ② 필터 내부: 키 → murmur64(key+seed) → 3개 위치 + 8비트 지문
+//! Two hash layers:
+//!   1. chaza level (application): token → xxhash64 → u64 key (hash.zig key64)
+//!   2. filter level (internal): key → murmur64(key+seed) → 3 positions + 8-bit fingerprint
 
 const std = @import("std");
 
 const ARITY: u32 = 3;
 const MAX_ITERATIONS: u32 = 100;
 
-// ── 직렬화 blob 헤더 (28바이트, little-endian) ──
-// DocEntry.filter_off가 가리키는 필터 데이터의 선두에 옴.
-// segment_length_mask = segment_length - 1 (역산 가능, 저장 생략).
+// ── Serialization blob header (28 bytes, little-endian) ──
+// At start of filter data pointed by DocEntry.filter_off.
+// segment_length_mask = segment_length - 1 (derivable, not stored).
+//
+// Blob header layout (offsets 0-27):
+//   Offset 0-7:   seed (u64) - used by BinaryFuse8View.fromBlob
+//   Offset 8-12:  size (u32) - stored but NOT used by BinaryFuse8View.fromBlob (unused at lookup)
+//   Offset 12-16: segment_length (u32) - used by BinaryFuse8View.fromBlob
+//   Offset 16-20: segment_count (u32) - stored but NOT used by BinaryFuse8View.fromBlob (unused at lookup)
+//   Offset 20-24: segment_count_length (u32) - used by BinaryFuse8View.fromBlob
+//   Offset 24-28: array_length (u32) - used by BinaryFuse8View.fromBlob
+//   Offset 28+:   fingerprints (array_length bytes) - used by BinaryFuse8View.fromBlob
+//
+// Note: size (offset 8-12) and segment_count (offset 16-20) are written by writeBlob but not
+// read by fromBlob. Changing their offsets would break the writeBlob/fromBlob offset agreement.
+// Future changes to fromBlob must maintain compatibility with existing blob data.
 
 pub const FUSE_BLOB_HEADER_SIZE: usize = 28;
 
-/// ── 해시 유틸리티 (C 참조와 동일 알고리즘) ──
+/// ── Hash utilities (same algorithm as C reference) ──
 
 /// murmur64 finalizer (C binary_fuse_murmur64).
 inline fn murmur64(h: u64) u64 {
@@ -34,23 +47,23 @@ inline fn murmur64(h: u64) u64 {
     return x;
 }
 
-/// key + seed를 믹스 (C binary_fuse_mix_split).
+/// Mix key + seed (C binary_fuse_mix_split).
 inline fn mixSplit(key: u64, seed: u64) u64 {
     return murmur64(key +% seed);
 }
 
-/// 빠른 모듈러 감소 (C binary_fuse_reduce). hash * n >> 32.
+/// Fast modular reduction (C binary_fuse_reduce). hash * n >> 32.
 inline fn reduce(hash: u32, n: u32) u32 {
     return @intCast((@as(u64, hash) * @as(u64, n)) >> 32);
 }
 
-/// 8비트 지문 (C binary_fuse8_fingerprint).
+/// 8-bit fingerprint (C binary_fuse8_fingerprint).
 inline fn fingerprint8(hash: u64) u8 {
     return @truncate(hash ^ (hash >> 32));
 }
 
-/// 64×64 곱셈의 상위 64비트 (C binary_fuse_mulhi).
-/// Zig u128 산술로 C __uint128_t와 동일 결과 보장.
+/// Upper 64 bits of 64×64 multiplication (C binary_fuse_mulhi).
+/// Zig u128 arithmetic guarantees same result as C __uint128_t.
 inline fn mulhi(a: u64, b: u64) u64 {
     return @truncate((@as(u128, a) * @as(u128, b)) >> 64);
 }
@@ -68,7 +81,7 @@ inline fn mod3(x: u8) u8 {
     return if (x > 2) x - 3 else x;
 }
 
-/// 단일 키의 3개 해시 위치 산출 (C binary_fuse8_hash).
+/// Calculate 3 hash positions for single key (C binary_fuse8_hash).
 /// index ∈ {0, 1, 2}.
 inline fn hashPosition(index: u64, hash: u64, seg_len: u32, seg_count_len: u32, seg_len_mask: u32) u32 {
     var h = mulhi(hash, seg_count_len);
@@ -79,7 +92,7 @@ inline fn hashPosition(index: u64, hash: u64, seg_len: u32, seg_count_len: u32, 
     return @truncate(h);
 }
 
-/// 세 위치를 한 번에 산출 (C binary_fuse8_hash_batch).
+/// Calculate all three positions at once (C binary_fuse8_hash_batch).
 pub const HashBatch = struct { h0: u32, h1: u32, h2: u32 };
 
 inline fn hashBatch(hash: u64, seg_len: u32, seg_count_len: u32, seg_len_mask: u32) HashBatch {
@@ -96,7 +109,7 @@ inline fn hashBatch(hash: u64, seg_len: u32, seg_count_len: u32, seg_len_mask: u
     return ans;
 }
 
-// ── 파라미터 산출 (C binary_fuse_calculate_*) ──
+// ── Parameter calculation (C binary_fuse_calculate_*) ──
 
 fn calculateSegmentLength(size: u32) u32 {
     if (size == 0) return 4;
@@ -112,7 +125,7 @@ fn calculateSizeFactor(size: u32) f64 {
     return @max(1.125, 0.875 + 0.25 * @log(1000000.0) / @log(@as(f64, @floatFromInt(size))));
 }
 
-/// 키 개수로부터 필터 파라미터 산출 (할당 없음).
+/// Calculate filter parameters from key count (no allocation).
 pub const Params = struct {
     segment_length: u32,
     segment_count: u32,
@@ -151,12 +164,12 @@ pub fn computeParams(size: u32) Params {
     };
 }
 
-/// 키 개수로부터 blob 전체 바이트 수 (28 헤더 + 지문).
+/// Total blob size in bytes for a filter holding size keys (28-byte header + fingerprints)
 pub fn blobSize(size: u32) usize {
     return FUSE_BLOB_HEADER_SIZE + computeParams(size).array_length;
 }
 
-// ── 소유형 필터 (생성기용) ──
+// ── Owned filter (for generator) ──
 
 pub const BinaryFuse8 = struct {
     seed: u64,
@@ -172,7 +185,7 @@ pub const BinaryFuse8 = struct {
         return self.segment_length - 1;
     }
 
-    /// size개 키를 담을 수 있는 필터 할당.
+    /// Allocate filter capable of holding size keys.
     pub fn init(allocator: std.mem.Allocator, size: u32) !BinaryFuse8 {
         const p = computeParams(size);
         const fingerprints = try allocator.alloc(u8, p.array_length);
@@ -194,7 +207,7 @@ pub const BinaryFuse8 = struct {
         self.allocator.free(self.fingerprints);
     }
 
-    /// key가 집합에 있는가? (오탐 가능 ≈ 0.4%)
+    /// Returns true if the key is (probably) in the set. False positive rate ≈ 0.4%.
     pub fn contains(self: BinaryFuse8, key: u64) bool {
         const hash = mixSplit(key, self.seed);
         const f = fingerprint8(hash);
@@ -203,12 +216,12 @@ pub const BinaryFuse8 = struct {
         return result == 0;
     }
 
-    /// keys로 필터 구성. keys는 변경될 수 있음 (중복 제거 시 재정렬).
+    /// Populate the filter. `keys` may be mutated (sorted/deduplicated in place).
     pub fn populate(self: *BinaryFuse8, keys: []u64) !void {
         var size: u32 = @intCast(keys.len);
         if (size != self.size) return error.SizeMismatch;
 
-        if (size == 0) return; // 빈 필터
+        if (size == 0) return; // empty filter - nothing to populate
 
         const a = self.allocator;
         const capacity = self.array_length;
@@ -248,12 +261,12 @@ pub const BinaryFuse8 = struct {
         while (true) : (loop += 1) {
             if (loop + 1 > MAX_ITERATIONS) return error.ConstructionFailed;
 
-            // startPos 초기화
+            // Initialize startPos
             for (0..block) |i| {
                 start_pos[i] = @intCast((@as(u64, @intCast(i)) * @as(u64, size)) >> block_bits);
             }
 
-            // 해시 분배
+            // Distribute hashes into segments
             const mask_block: u32 = block - 1;
             for (0..size) |i| {
                 const hash = murmur64(keys[i] +% self.seed);
@@ -266,7 +279,7 @@ pub const BinaryFuse8 = struct {
                 start_pos[seg_idx] += 1;
             }
 
-            // 카운팅
+            // Count occurrences
             var err: bool = false;
             var duplicates: u32 = 0;
             for (0..size) |i| {
@@ -283,7 +296,7 @@ pub const BinaryFuse8 = struct {
                 t2hash[h2] ^= hash;
                 t2count[h2] ^= 2;
 
-                // 중복 검출
+                // Duplicate detection
                 if ((t2hash[h0] & t2hash[h1] & t2hash[h2]) == 0) {
                     if ((t2hash[h0] == 0 and t2count[h0] == 8) or
                         (t2hash[h1] == 0 and t2count[h1] == 8) or
@@ -313,7 +326,7 @@ pub const BinaryFuse8 = struct {
                 continue;
             }
 
-            // 필링 (peeling)
+            // Peel the hypergraph
             var q_size: u32 = 0;
             for (0..capacity) |i| {
                 alone[q_size] = @intCast(i);
@@ -365,7 +378,7 @@ pub const BinaryFuse8 = struct {
             self.seed = rngSplitmix64(&rng_counter);
         }
 
-        // 지문 할당 (역순)
+        // Assign fingerprints (in reverse peeling order)
         var i: u32 = size;
         while (i > 0) {
             i -= 1;
@@ -385,12 +398,12 @@ pub const BinaryFuse8 = struct {
         }
     }
 
-    /// 직렬화 blob 전체 바이트 수 = 28 (헤더) + array_length (지문).
+    /// Total serialized blob byte count = 28 (header) + array_length (fingerprints).
     pub fn blobBytes(self: BinaryFuse8) usize {
         return FUSE_BLOB_HEADER_SIZE + self.array_length;
     }
 
-    /// blob 헤더 + 지문을 buf에 기록. buf.len >= blobBytes여야 함.
+    /// Write blob header + fingerprints to buf. buf.len >= blobBytes required.
     pub fn writeBlob(self: BinaryFuse8, buf: []u8) void {
         std.debug.assert(buf.len >= self.blobBytes());
         std.mem.writeInt(u64, buf[0..8], self.seed, .little);
@@ -403,7 +416,7 @@ pub const BinaryFuse8 = struct {
     }
 };
 
-/// keys에서 중복 제거 (정렬 후 인접 비교). 새 길이 반환.
+/// Remove duplicates from keys (sort then adjacent comparison). Return new length.
 fn sortAndRemoveDup(keys: []u64, len: usize) u32 {
     std.mem.sort(u64, keys[0..len], {}, std.sort.asc(u64));
     if (len <= 1) return @intCast(len);
@@ -418,9 +431,9 @@ fn sortAndRemoveDup(keys: []u64, len: usize) u32 {
     return @intCast(j);
 }
 
-// ── zero-copy 뷰 (런타임용) ──
+// ── zero-copy view (for runtime) ──
 
-/// 직렬화된 blob 바이트에서 뷰 생성. 할당 없음.
+/// Create view from serialized blob bytes. No allocation.
 pub const BinaryFuse8View = struct {
     seed: u64,
     segment_length: u32,
@@ -428,7 +441,7 @@ pub const BinaryFuse8View = struct {
     segment_length_mask: u32,
     fingerprints: []const u8,
 
-    /// blob 바이트에서 뷰 파싱. blob이 너무 짧으면 null.
+    /// Parse view from blob bytes. null if blob too short.
     pub fn fromBlob(blob: []const u8) ?BinaryFuse8View {
         if (blob.len < FUSE_BLOB_HEADER_SIZE) return null;
         const seed = std.mem.readInt(u64, blob[0..8], .little);
@@ -446,7 +459,7 @@ pub const BinaryFuse8View = struct {
         };
     }
 
-    /// key가 집합에 있는가?
+    /// Is key in set?
     pub fn contains(self: BinaryFuse8View, key: u64) bool {
         const hash = mixSplit(key, self.seed);
         const f = fingerprint8(hash);
@@ -456,13 +469,13 @@ pub const BinaryFuse8View = struct {
     }
 };
 
-// ── 단정 테스트 ────────────────────────────────────────────────────
+// ── Assertion tests ────────────────────────────────────────────────────
 
 test "calculateSegmentLength: size=0 → 4" {
     try std.testing.expectEqual(@as(u32, 4), calculateSegmentLength(0));
 }
 
-test "computeParams: size=0 → 최소 필터" {
+test "computeParams: size=0 → minimum filter" {
     const p = computeParams(0);
     try std.testing.expectEqual(@as(u32, 4), p.segment_length);
     // segment_count=1, array_length = (1+2)*4 = 12
@@ -474,7 +487,7 @@ test "blobSize: size=0 → 28 + 12 = 40" {
     try std.testing.expectEqual(@as(usize, 40), blobSize(0));
 }
 
-test "blobSize: 단조 증가 (대략)" {
+test "blobSize: monotonically increasing (approximately)" {
     const s0 = blobSize(0);
     const s10 = blobSize(10);
     const s100 = blobSize(100);
@@ -484,35 +497,35 @@ test "blobSize: 단조 증가 (대략)" {
     try std.testing.expect(s100 <= s1000);
 }
 
-test "calculateSegmentLength: 2의 거듭제곱" {
+test "calculateSegmentLength: power of 2" {
     const seg = calculateSegmentLength(1000);
     try std.testing.expect(seg > 0);
-    // 2의 거듭제곱 확인
+    // Verify power of 2
     try std.testing.expect((seg & (seg - 1)) == 0);
 }
 
-test "calculateSegmentLength: 큰 n에서도 상한 이하" {
+test "calculateSegmentLength: upper limit bound even for large n" {
     const seg = calculateSegmentLength(10_000_000);
     try std.testing.expect(seg > 0);
     try std.testing.expect(seg <= 262144);
-    try std.testing.expect((seg & (seg - 1)) == 0); // 2의 거듭제곱
+    try std.testing.expect((seg & (seg - 1)) == 0); // power of 2
 }
 
-test "BinaryFuse8: 빈 필터 (size=0) — 미삽입 키는 대부분 false" {
+test "BinaryFuse8: empty filter (size=0) — non-inserted keys mostly false" {
     var f = try BinaryFuse8.init(std.testing.allocator, 0);
     defer f.deinit();
     try f.populate(&.{});
-    // 빈 필터의 모든 지문은 0. contains(key)는 fingerprint8(hash)==0일 때만 true (≈0.4%).
-    // 여러 키를 시도해 대부분 false인지 확인.
+    // All fingerprints in empty filter are 0. contains(key) true only if fingerprint8(hash)==0 (≈0.4%).
+    // Try multiple keys to verify mostly false.
     var false_count: u32 = 0;
     for (0..1000) |i| {
         if (!f.contains(@as(u64, i))) false_count += 1;
     }
-    // 대부분 false (일부 오탐 허용)
+    // Mostly not-contained; a few false positives are expected
     try std.testing.expect(false_count > 900);
 }
 
-test "BinaryFuse8: 단일 키" {
+test "BinaryFuse8: single key" {
     var f = try BinaryFuse8.init(std.testing.allocator, 1);
     defer f.deinit();
     var keys = [_]u64{12345};
@@ -520,7 +533,7 @@ test "BinaryFuse8: 단일 키" {
     try std.testing.expect(f.contains(12345));
 }
 
-test "BinaryFuse8: 여러 키 — 삽입한 키 전부 true" {
+test "BinaryFuse8: multiple keys — all inserted keys true" {
     const n: u32 = 100;
     var f = try BinaryFuse8.init(std.testing.allocator, n);
     defer f.deinit();
@@ -534,16 +547,16 @@ test "BinaryFuse8: 여러 키 — 삽입한 키 전부 true" {
     }
 }
 
-test "BinaryFuse8: 미삽입 키 — 대부분 false" {
+test "BinaryFuse8: non-inserted keys — mostly false" {
     const n: u32 = 10000;
     var f = try BinaryFuse8.init(std.testing.allocator, n);
     defer f.deinit();
 
     var keys: [10000]u64 = undefined;
-    for (0..n) |i| keys[i] = @as(u64, i * 2); // 짝수
+    for (0..n) |i| keys[i] = @as(u64, i * 2); // even
     try f.populate(&keys);
 
-    // 홀수는 삽입 안 함 → 오탐률 ≈ 0.4%
+    // Odd numbers not inserted → false positive rate ≈ 0.4%
     var false_positives: u32 = 0;
     const test_count: u32 = 10000;
     for (0..test_count) |i| {
@@ -551,11 +564,11 @@ test "BinaryFuse8: 미삽입 키 — 대부분 false" {
         if (f.contains(odd_key)) false_positives += 1;
     }
     const fp_rate = @as(f64, @floatFromInt(false_positives)) / @as(f64, @floatFromInt(test_count));
-    // 이론적 ≈ 0.0039 (0.39%). 여유 있게 2% 미만 확인.
+    // Theoretical ≈ 0.0039 (0.39%). Verify < 2% with margin.
     try std.testing.expect(fp_rate < 0.02);
 }
 
-test "BinaryFuse8: 직렬화/역직렬화 왕복 — 동일 조회 결과" {
+test "BinaryFuse8: serialize/deserialize roundtrip — identical lookup results" {
     const n: u32 = 200;
     var f = try BinaryFuse8.init(std.testing.allocator, n);
     defer f.deinit();
@@ -564,27 +577,27 @@ test "BinaryFuse8: 직렬화/역직렬화 왕복 — 동일 조회 결과" {
     for (0..n) |i| keys[i] = @as(u64, i * 31 + 17);
     try f.populate(&keys);
 
-    // blob 기록
+    // Write blob
     const blob_size = f.blobBytes();
     const blob = try std.testing.allocator.alloc(u8, blob_size);
     defer std.testing.allocator.free(blob);
     f.writeBlob(blob);
 
-    // 뷰로 역직렬화
+    // Deserialize to view
     const view = BinaryFuse8View.fromBlob(blob) orelse return error.UnexpectedNull;
 
-    // 삽입 키 전부 true
+    // All inserted keys true
     for (keys) |k| {
         try std.testing.expect(view.contains(k));
     }
-    // 미삽입 키는 f.contains와 동일 결과
+    // Non-inserted keys give same result as f.contains
     for (0..500) |i| {
         const k = @as(u64, i * 99 + 3);
         try std.testing.expectEqual(f.contains(k), view.contains(k));
     }
 }
 
-test "BinaryFuse8: 큰 키 집합 (1000) — 전체 true" {
+test "BinaryFuse8: large key set (1000) — all true" {
     const n: u32 = 1000;
     var f = try BinaryFuse8.init(std.testing.allocator, n);
     defer f.deinit();
@@ -603,7 +616,7 @@ test "BinaryFuse8: 큰 키 집합 (1000) — 전체 true" {
     try std.testing.expect(all_found);
 }
 
-test "BinaryFuse8: 같은 키 집합 — 결정론적 (같은 seed → 같은 결과)" {
+test "BinaryFuse8: same key set — deterministic (same seed to same result)" {
     const n: u32 = 50;
     const keys_a = try std.testing.allocator.alloc(u64, n);
     defer std.testing.allocator.free(keys_a);
@@ -626,12 +639,12 @@ test "BinaryFuse8: 같은 키 집합 — 결정론적 (같은 seed → 같은 �
     try std.testing.expectEqualSlices(u8, f1.fingerprints, f2.fingerprints);
 }
 
-test "BinaryFuse8View.fromBlob: 너무 짧은 blob → null" {
+test "BinaryFuse8View.fromBlob: too short blob → null" {
     const tiny: [10]u8 = .{0} ** 10;
     try std.testing.expect(BinaryFuse8View.fromBlob(&tiny) == null);
 }
 
-test "BinaryFuse8View.fromBlob: 올바른 헤더 파싱" {
+test "BinaryFuse8View.fromBlob: correct header parsing" {
     var f = try BinaryFuse8.init(std.testing.allocator, 10);
     defer f.deinit();
     var keys: [10]u64 = undefined;
@@ -650,7 +663,7 @@ test "BinaryFuse8View.fromBlob: 올바른 헤더 파싱" {
     try std.testing.expectEqualSlices(u8, f.fingerprints, view.fingerprints);
 }
 
-test "sortAndRemoveDup: 중복 제거" {
+test "sortAndRemoveDup: remove duplicates" {
     var keys = [_]u64{ 5, 3, 5, 1, 3, 5, 2 };
     const new_len = sortAndRemoveDup(&keys, keys.len);
     try std.testing.expectEqual(@as(u32, 4), new_len);

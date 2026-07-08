@@ -1,11 +1,11 @@
-//! writer → reader 왕복 통합 테스트.
-//! writer.zig와 reader.zig가 병렬로 refactor되어 호환성을 직접 검증.
+//! writer → reader roundtrip integration tests.
+//! writer.zig and reader.zig refactored in parallel, directly verify compatibility.
 
 const std = @import("std");
 const writer = @import("writer.zig");
 const reader = @import("reader.zig");
 
-test "왕복: 단일 문서 title/url/meta 접근" {
+test "roundtrip: single document title/url/meta access" {
     const allocator = std.testing.allocator;
     const docs = [_]writer.DocInput{
         .{
@@ -24,7 +24,7 @@ test "왕복: 단일 문서 title/url/meta 접근" {
 
     const view = try reader.IndexView.open(bytes);
 
-    // 헤더
+    // Header
     try std.testing.expectEqual(@as(u32, 1), view.header.num_docs);
     try std.testing.expectEqual(@as(u32, 1), view.header.num_meta_fields);
 
@@ -36,12 +36,12 @@ test "왕복: 단일 문서 title/url/meta 접근" {
     try std.testing.expectEqualStrings("2026-01-01", view.metaValue(0, 0).?);
     try std.testing.expectEqualStrings("date", view.metaNameAt(0).?);
 
-    // filter 존재 (내용은 stand-alone 테스트에서)
+    // filter exists (content verified in stand-alone test)
     const filter = view.docFilter(0).?;
     try std.testing.expect(filter.len > 0);
 }
 
-test "왕복: 다중 문서, 다중 메타" {
+test "roundtrip: multiple documents, multiple meta" {
     const allocator = std.testing.allocator;
     const docs = [_]writer.DocInput{
         .{
@@ -80,12 +80,12 @@ test "왕복: 다중 문서, 다중 메타" {
     try std.testing.expectEqualStrings("2026-02-01", view.metaValue(1, 0).?);
     try std.testing.expectEqualStrings("tech", view.metaValue(1, 1).?);
 
-    // meta 이름
+    // meta names
     try std.testing.expectEqualStrings("date", view.metaNameAt(0).?);
     try std.testing.expectEqualStrings("tag", view.metaNameAt(1).?);
 }
 
-test "왕복: binary fuse filter에 토큰이 기록됨" {
+test "roundtrip: tokens recorded in binary fuse filter" {
     const allocator = std.testing.allocator;
     const tokens = [_][]const u8{ "alpha", "beta", "gamma" };
     const docs = [_]writer.DocInput{
@@ -106,7 +106,7 @@ test "왕복: binary fuse filter에 토큰이 기록됨" {
     const view = try reader.IndexView.open(bytes);
     const filter_bytes = view.docFilter(0).?;
 
-    // binary fuse filter 뷰로 역직렬화해 contains 확인
+    // Deserialize as binary fuse filter view and verify contains
     const binary_fuse = @import("../pipeline/binary_fuse.zig");
     const hash = @import("../pipeline/hash.zig");
     const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
@@ -116,7 +116,7 @@ test "왕복: binary fuse filter에 토큰이 기록됨" {
     }
 }
 
-test "왕복: 빈 문서(tokens=[])도 정상" {
+test "roundtrip: empty document(tokens=[]) also normal" {
     const allocator = std.testing.allocator;
     const docs = [_]writer.DocInput{
         .{
@@ -138,12 +138,12 @@ test "왕복: 빈 문서(tokens=[])도 정상" {
     try std.testing.expectEqualStrings("/e", view.url(0).?);
     try std.testing.expectEqualStrings("none", view.metaValue(0, 0).?);
 
-    // filter blob은 최소 40바이트 (28헤더 + 12지문)
+    // filter blob minimum 40 bytes (28header + 12fingerprints)
     const filter = view.docFilter(0).?;
     try std.testing.expectEqual(@as(usize, 40), filter.len);
 }
 
-test "왕복: 범위 초과 doc_id → null" {
+test "roundtrip: out of bounds doc_id → null" {
     const allocator = std.testing.allocator;
     const docs = [_]writer.DocInput{
         .{ .tokens = &.{"x"}, .title = "X", .url = "/x", .meta_values = &.{} },

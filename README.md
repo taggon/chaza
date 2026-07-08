@@ -6,7 +6,7 @@ A minimal static-site search engine — Zig + WASM. Finds Korean text even when 
 
 - **Small.** The index stores binary fuse filters, not document text. ~0.5 MB for a few hundred pages.
 - **Korean choseong search.** Type ㄱㄴ and match 가나, 강남, 경남…
-- **All query work in WASM.** Tokenization, hashing, lookup, sorting — all in the bundled WASM module. JavaScript only passes strings and renders results.
+- **All query work in WASM.** Tokenization, hashing, lookup, ranking — all in the bundled WASM module. JavaScript only passes strings and renders results.
 - **No toolchain for end users.** The runtime WASM is embedded in the CLI binary. Building an index is just byte concatenation — no compiler needed.
 
 ## Install
@@ -51,7 +51,7 @@ Add `--no-js` to skip writing the loader.
 </script>
 ```
 
-Each result contains `{ title, url, meta }`.
+Each result contains `{ title, url, meta, hits }` — `hits` is the number of query tokens that matched (0~16).
 
 ## CLI
 
@@ -109,25 +109,27 @@ Numbers are stringified automatically.
 |-------|---------|-------------|
 | `indexed_fields` | `["title"]` | Fields to tokenize and index |
 | `metadata_fields` | `[]` | Fields to store for display (not indexed) |
+| `prefix_fields` | `["title"]` | Fields whose words also match by prefix (2–8 chars) while typing. Must be a subset of `indexed_fields`; `[]` disables |
 | `url_field` | `"url"` | Which field holds the URL |
 | `choseong_search` | `true` | Enable choseong prefix tokens |
 | `choseong_max_len` | `3` | Max choseong prefix length (1–3) |
 
 ## Search behavior
 
-- **Multi-token queries are AND** — all tokens must match.
-- **No ranking.** Results are returned in document order (or sorted by a metadata field).
+- **Multi-token queries are OR with hit-count ranking.** Any document matching at least one token is a candidate; documents matching more tokens rank higher, so all-token (AND) matches come first. Ties keep document input order.
+- **Each result carries `hits`** — the number of query tokens that matched (range 0~16). Use it to badge strong matches or post-filter weak ones.
+- **At most 16 query tokens are considered.** Tokens beyond the 16th are ignored (bounds false-positive noise and lookup cost).
+- **The last query token also matches by prefix.** While typing, the last token (2–8 chars) matches words in `prefix_fields` (default: title) that start with it — `progr` finds a title containing "Programming". Other fields still need exact word matches.
 - **Choseong tokens work like regular tokens.** A query `ㅅㅈ` matches any document whose indexed text contains a word starting with those initial consonants.
 - **`max_results`** defaults to 20; pass 0 for the default.
 
 ```js
 chaza.search("hello", { maxResults: 10 });
-chaza.search("hello", { sortFieldIdx: 0, sortDesc: true });
 ```
 
 ### Sorting
 
-Metadata field sorting is **string lexicographic only** (ascending or descending). Documents missing the field go last. For date/number sorting, use ISO 8601 dates or zero-padded numbers in the input data.
+Results are always ordered by matched-token count, descending. If you need a different order (date, etc.), sort the returned array in JavaScript — it holds at most `max_results` entries, so the cost is negligible.
 
 ## How it works
 
@@ -138,9 +140,12 @@ Metadata field sorting is **string lexicographic only** (ascending or descending
 3. Remove stopwords (`--stopwords` file)
 4. Deduplicate per document
 5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 1–`choseong_max_len`
-6. Deduplicate again
+6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints
+7. Deduplicate again
 
 The indexer and runtime share the same Zig tokenization code — bit-level consistency is guaranteed.
+
+**Stopwords are removed at index time only.** The stopword list is not shipped in the bundle, so the runtime cannot filter them from queries — a stopword never matches any document. If only some query tokens are stopwords, the remaining tokens still match (OR ranking); **if every token is a stopword, the result is empty.**
 
 ### Filter: Binary Fuse (BinaryFuse8)
 
@@ -163,7 +168,8 @@ The tail meta stores `wasm_len` and `index_len` (little-endian). The loader read
 ## Limitations
 
 - **Input must be UTF-8 + NFC.** NFD (decomposed) Hangul will break choseong extraction.
-- **String sort only.** No numeric or date-aware sorting. Use ISO 8601 / zero-padding in the source data.
+- **No metadata sorting.** Results are fixed to matched-token-count order. Sort the returned array in JavaScript for other orders.
+- **Stopwords are not searchable.** They are removed from the index, so a query made up entirely of stopwords returns nothing.
 - **Static index.** No incremental updates. Rebuild from the corpus to add/remove documents.
 - **False positives.** ~0.4% of queries may match a document that doesn't actually contain the token. There is no brute-force verification step.
 

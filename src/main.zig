@@ -1,6 +1,6 @@
-//! chaza CLI — 코퍼스 JSON → 검색 가능한 정적 번들.
+//! chaza CLI — corpus JSON → searchable static bundle.
 //!
-//! 사용법:
+//! Usage:
 //!   chaza build corpus.json [-o chaza.wasm] [--config config.json]
 //!                          [--stopwords stopwords.txt] [--no-choseong]
 //!                          [--no-js] [-q]
@@ -10,7 +10,7 @@ const chaza = @import("chaza");
 const generator = chaza.generator;
 const embeds = @import("chaza_embeds");
 
-// build.zig가 runtime.wasm과 chaza.js를 @embedFile로 주입.
+// build.zig injects runtime.wasm and chaza.js via @embedFile.
 const RUNTIME_WASM: []const u8 = embeds.runtime_wasm;
 const LOADER_JS: []const u8 = embeds.loader_js;
 
@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
 
     const corpus_path = args[2];
 
-    // 기본값
+    // Defaults
     var output_path: []const u8 = "chaza.bundle";
     var config_path: ?[]const u8 = null;
     var stopwords_path: ?[]const u8 = null;
@@ -47,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var no_js = false;
     var quiet = false;
 
-    // 옵션 파싱 (수동)
+    // Option parsing (manual)
     var i: usize = 3;
     while (i < args.len) {
         const arg = args[i];
@@ -79,16 +79,16 @@ pub fn main(init: std.process.Init) !void {
         i += 1;
     }
 
-    // corpus.json 읽기
+    // Read corpus.json
     const corpus_bytes = cwd.readFileAlloc(io, corpus_path, arena, .limited(200 * 1024 * 1024)) catch |err| {
         std.debug.print("chaza: cannot read '{s}': {}\n", .{ corpus_path, err });
         return err;
     };
 
-    // GenerateOptions 구성
+    // Configure GenerateOptions
     var options = generator.GenerateOptions{};
 
-    // config.json 적용
+    // Apply config.json
     if (config_path) |cp| {
         const config_bytes = cwd.readFileAlloc(io, cp, arena, .limited(10 * 1024 * 1024)) catch |err| {
             std.debug.print("chaza: cannot read config '{s}': {}\n", .{ cp, err });
@@ -97,10 +97,10 @@ pub fn main(init: std.process.Init) !void {
         options = try parseConfig(arena, config_bytes, options);
     }
 
-    // CLI 오버라이드
+    // CLI override
     if (no_choseong) options.choseong_max_len = 0;
 
-    // 불용어 파일 로드
+    // Load stopwords file
     var sw_count: ?usize = null;
     if (stopwords_path) |sp| {
         const sw_bytes = cwd.readFileAlloc(io, sp, arena, .limited(10 * 1024 * 1024)) catch |err| {
@@ -115,19 +115,19 @@ pub fn main(init: std.process.Init) !void {
         options.stopwords = sw;
     }
 
-    // 생성
+    // Generate
     const result = generator.generate(arena, corpus_bytes, RUNTIME_WASM, options) catch |err| {
         std.debug.print("chaza: generation failed: {}\n", .{err});
         return err;
     };
 
-    // 번들 쓰기
+    // Write bundle
     cwd.writeFile(io, .{ .sub_path = output_path, .data = result.bundle_bytes }) catch |err| {
         std.debug.print("chaza: cannot write '{s}': {}\n", .{ output_path, err });
         return err;
     };
 
-    // chaza.js 로더를 같은 디렉터리에 쓰기 (--no-js면 생략)
+    // Write chaza.js loader to same directory (omit if --no-js)
     if (!no_js) {
         const loader_path = blk: {
             if (std.mem.lastIndexOfScalar(u8, output_path, '/')) |sep| {
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    // 진행 로그 (stderr)
+    // Progress log (stderr)
     if (!quiet) {
         const choseong_status = if (options.choseong_max_len > 0) "on" else "off";
         std.debug.print("parsed {d} documents\n", .{result.num_docs});
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// chaza.json 설정 파일 파싱 → GenerateOptions에 반영.
+/// Parse chaza.json config file → apply to GenerateOptions.
 fn parseConfig(
     allocator: std.mem.Allocator,
     config_bytes: []const u8,
@@ -175,6 +175,9 @@ fn parseConfig(
             }
             if (schema.object.get("metadata_fields")) |f| {
                 if (f == .array) result.metadata_fields = try jsonArrayOfStrings(allocator, f.array.items);
+            }
+            if (schema.object.get("prefix_fields")) |f| {
+                if (f == .array) result.prefix_fields = try jsonArrayOfStrings(allocator, f.array.items);
             }
             if (schema.object.get("url_field")) |f| {
                 if (f == .string) result.url_field = f.string;
@@ -196,7 +199,7 @@ fn parseConfig(
     return result;
 }
 
-/// JSON 배열에서 문자열 슬라이스 추출.
+/// Extract string slice from JSON array.
 fn jsonArrayOfStrings(allocator: std.mem.Allocator, items: []std.json.Value) ![]const []const u8 {
     const result = try allocator.alloc([]const u8, items.len);
     for (items, 0..) |item, idx| {

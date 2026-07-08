@@ -66,10 +66,6 @@ interface DocEntryData {
 export interface SearchOptions {
   /** Max results to return. 0 = default (20). */
   maxResults?: number;
-  /** Metadata field index to sort by. -1 = no sort (document order). */
-  sortFieldIdx?: number;
-  /** Sort descending. Default false. */
-  sortDesc?: boolean;
 }
 
 /** A single search result. */
@@ -77,6 +73,12 @@ export interface SearchResult {
   title: string;
   url: string;
   meta: Record<string, string>;
+  /**
+   * Number of query tokens that matched this document (ranking key).
+   * Range 0~16: at most 16 query tokens are considered per search;
+   * tokens beyond that are ignored.
+   */
+  hits: number;
 }
 
 /** WASM export signatures. */
@@ -87,8 +89,6 @@ interface WasmExports {
     queryPtr: number,
     queryLen: number,
     maxResults: number,
-    sortFieldIdx: number,
-    sortDesc: boolean,
   ): number;
   memory: WebAssembly.Memory;
 }
@@ -386,16 +386,21 @@ export class Chaza {
   /**
    * Execute a search query.
    *
-   * Multi-token queries use AND semantics — all tokens must match.
+   * Multi-token queries use OR semantics with hit-count ranking:
+   * documents matching more tokens rank higher (all-token matches first),
+   * ties keep document input order. Each result carries `hits`, the number
+   * of matched tokens (0~16 — only the first 16 query tokens are considered).
+   *
+   * The last query token (the word being typed) also matches as a word
+   * prefix (2~8 chars) against fields indexed with prefix support
+   * (prefix_fields, default: title).
    *
    * @param query - Search query string (UTF-8).
    * @param opts - Search options.
-   * @returns Array of matching results.
+   * @returns Array of matching results, best matches first.
    */
   search(query: string, opts: SearchOptions = {}): SearchResult[] {
     const maxResults = opts.maxResults ?? 0;
-    const sortFieldIdx = opts.sortFieldIdx ?? -1;
-    const sortDesc = opts.sortDesc ?? false;
 
     const exports = this._exports;
 
@@ -412,23 +417,19 @@ export class Chaza {
     qView.set(queryBytes);
 
     // Call search
-    const resultPtr = exports.search(
-      qPtr,
-      queryBytes.length,
-      maxResults,
-      sortFieldIdx,
-      sortDesc,
-    );
+    const resultPtr = exports.search(qPtr, queryBytes.length, maxResults);
 
     // Read results — fresh views (alloc may have grown memory)
     const indexDv = new DataView(this._memory.buffer, this._indexPtr);
     const memBytes = new Uint8Array(this._memory.buffer);
     const resultDv = new DataView(this._memory.buffer);
 
+    // Result buffer: [u32 count][(u32 doc_id, u32 hits) × count], little-endian
     const count = resultDv.getUint32(resultPtr, true);
     const results: SearchResult[] = [];
     for (let i = 0; i < count; i++) {
-      const docId = resultDv.getUint32(resultPtr + 4 + i * 4, true);
+      const docId = resultDv.getUint32(resultPtr + 4 + i * 8, true);
+      const hits = resultDv.getUint32(resultPtr + 8 + i * 8, true);
       const entry = getDocEntry(
         indexDv,
         memBytes,
@@ -448,6 +449,7 @@ export class Chaza {
         title: entry.title,
         url: entry.url,
         meta,
+        hits,
       });
     }
 

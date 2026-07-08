@@ -1,35 +1,35 @@
-//! chaza 번들 조립/파싱 — [wasm][index][TailMeta 16B] 형식.
+//! chaza bundle assembly/parsing — [wasm][index][TailMeta 16B] format.
 //!
-//! 생성기는 assemble()로 세 영역을 하나로 붙여 .bundle 파일을 만들고,
-//! 로더(JS)는 파일 끝 16바이트(TailMeta)를 먼저 읽어 wasm_len / index_len을 얻은 뒤
-//! 각 영역 슬라이스를 추출한다. open()은 그 로직의 Zig 구현 (테스트·검증용).
+//! Generator uses assemble() to concatenate three sections into .bundle file,
+//! and loader (JS) first reads file's last 16 bytes (TailMeta) to get wasm_len / index_len
+//! then extracts each section slice. open() is Zig implementation of that logic (for testing·verification).
 
 const std = @import("std");
 const format = @import("index/format.zig");
 const TailMeta = format.TailMeta;
 
-/// 번들 바이트를 할당해 반환. caller가 free.
+/// Allocate and return bundle bytes. caller free.
 /// layout: [wasm_bytes][index_bytes][pad to 4B][TailMeta 16B LE]
-/// tail_off는 TailMeta의 4바이트 정렬 요구를 만족해야 함.
+/// tail_off must satisfy TailMeta's 4-byte alignment requirement.
 pub fn assemble(
     allocator: std.mem.Allocator,
     wasm_bytes: []const u8,
     index_bytes: []const u8,
 ) ![]u8 {
     const index_end = wasm_bytes.len + index_bytes.len;
-    // TailMeta(u32 포함) → 4바이트 정렬 필요. index_end를 4의 배수로 올림.
+    // TailMeta (including u32) requires 4-byte alignment. Round index_end up to multiple of 4.
     const aligned_tail_off = (index_end + 3) & ~@as(usize, 3);
     const pad_len = aligned_tail_off - index_end;
     const total = aligned_tail_off + format.TAIL_META_SIZE;
     const buf = try allocator.alloc(u8, total);
-    @memset(buf, 0); // 패딩 영역 0으로.
+    @memset(buf, 0); // padding region to 0.
 
-    // wasm 영역 복사
+    // Copy wasm section
     @memcpy(buf[0..wasm_bytes.len], wasm_bytes);
-    // index 영역 복사
+    // Copy index section
     @memcpy(buf[wasm_bytes.len..][0..index_bytes.len], index_bytes);
 
-    // TailMeta 기록 (필드별 리틀엔디안 기록 — alignCast 불필요)
+    // Write TailMeta (little-endian per field — alignCast not needed)
     const t = aligned_tail_off;
     std.mem.writeInt(u32, buf[t..][0..4], format.MAGIC, .little);
     buf[t + 4] = format.VERSION;
@@ -38,11 +38,11 @@ pub fn assemble(
     buf[t + 7] = 0;
     std.mem.writeInt(u32, buf[t + 8..][0..4], @intCast(wasm_bytes.len), .little);
     std.mem.writeInt(u32, buf[t + 12..][0..4], @intCast(index_bytes.len), .little);
-    _ = pad_len; // 패딩은 buf의 memset(0)으로 채워짐.
+    _ = pad_len; // padding filled by buf's memset(0).
     return buf;
 }
 
-/// open 결과: 각 섹션 슬라이스 + TailMeta 값 (모두 입력 bytes 내부 참조).
+/// open result: each section slice + TailMeta values (all references inside input bytes).
 pub const BundleView = struct {
     wasm: []const u8,
     index: []const u8,
@@ -56,13 +56,13 @@ pub const OpenError = error{
     LengthMismatch,
 };
 
-/// 번들 바이트에서 각 섹션 슬라이스 추출. 할당 없음 (빌려쓰기).
+/// Extract each section slice from bundle bytes. No allocation (borrowed).
 pub fn open(bytes: []const u8) OpenError!BundleView {
     if (bytes.len < format.TAIL_META_SIZE) return error.Truncated;
 
     const tail_off = bytes.len - format.TAIL_META_SIZE;
 
-    // 필드별 리틀엔디안 읽기 (alignCast 불필요)
+    // Little-endian read per field (alignCast not needed)
     const magic = std.mem.readInt(u32, bytes[tail_off..][0..4], .little);
     const version = bytes[tail_off + 4];
     const wasm_len: usize = std.mem.readInt(u32, bytes[tail_off + 8..][0..4], .little);
@@ -89,9 +89,9 @@ pub fn open(bytes: []const u8) OpenError!BundleView {
     };
 }
 
-// ── 단정 테스트 ────────────────────────────────────────────────────
+// ── Assertion tests ────────────────────────────────────────────────────
 
-test "assemble: 단순 케이스 — wasm 4B, index 8B → 총 28B" {
+test "assemble: simple case — wasm 4B, index 8B → total 28B" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -100,7 +100,7 @@ test "assemble: 단순 케이스 — wasm 4B, index 8B → 총 28B" {
     try std.testing.expectEqual(@as(usize, 28), bundle.len);
 }
 
-test "assemble: TailMeta magic/version/길이 필드 byte 단위 검증" {
+test "assemble: TailMeta magic/version/length fields byte-level verification" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -136,7 +136,7 @@ test "assemble: TailMeta magic/version/길이 필드 byte 단위 검증" {
     try std.testing.expectEqual(@as(u8, 0), bundle[t + 15]);
 }
 
-test "assemble: wasm과 index가 순서대로 복사됨" {
+test "assemble: wasm and index copied in order" {
     const wasm = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     const index = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -146,7 +146,7 @@ test "assemble: wasm과 index가 순서대로 복사됨" {
     try std.testing.expectEqualSlices(u8, &index, bundle[4..12]);
 }
 
-test "open: 정상 — wasm/index 슬라이스가 assemble 입력과 동일" {
+test "open: normal — wasm/index slices identical to assemble input" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -164,7 +164,7 @@ test "open: Truncated (bytes < 16)" {
     try std.testing.expectError(error.Truncated, open(&tiny));
 }
 
-test "open: InvalidMagic (magic 변조)" {
+test "open: InvalidMagic (magic tampered)" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -172,12 +172,12 @@ test "open: InvalidMagic (magic 변조)" {
 
     var corrupted = try std.testing.allocator.dupe(u8, bundle);
     defer std.testing.allocator.free(corrupted);
-    corrupted[corrupted.len - 16] = 0x00; // magic 첫 바이트 변조
+    corrupted[corrupted.len - 16] = 0x00; // tamper magic first byte
 
     try std.testing.expectError(error.InvalidMagic, open(corrupted));
 }
 
-test "open: InvalidVersion (version 변조)" {
+test "open: InvalidVersion (version tampered)" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -185,12 +185,12 @@ test "open: InvalidVersion (version 변조)" {
 
     var corrupted = try std.testing.allocator.dupe(u8, bundle);
     defer std.testing.allocator.free(corrupted);
-    corrupted[corrupted.len - 12] = 99; // version 변조
+    corrupted[corrupted.len - 12] = 99; // tamper version
 
     try std.testing.expectError(error.InvalidVersion, open(corrupted));
 }
 
-test "open: LengthMismatch (wasm_len 합이 실제와 안 맞음)" {
+test "open: LengthMismatch (wasm_len sum doesn't match actual)" {
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d };
     const index = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const bundle = try assemble(std.testing.allocator, &wasm, &index);
@@ -198,13 +198,13 @@ test "open: LengthMismatch (wasm_len 합이 실제와 안 맞음)" {
 
     var corrupted = try std.testing.allocator.dupe(u8, bundle);
     defer std.testing.allocator.free(corrupted);
-    // wasm_len 4 → 100: tail_off=12 이지만 100+8=108 ≠ 12
+    // wasm_len 4 → 100: tail_off=12 but 100+8=108 ≠ 12
     corrupted[corrupted.len - 8] = 100;
 
     try std.testing.expectError(error.LengthMismatch, open(corrupted));
 }
 
-test "assemble + open 왕복: 큰 wasm(1KB), 큰 index(2KB)" {
+test "assemble + open roundtrip: large wasm(1KB), large index(2KB)" {
     const wasm = try std.testing.allocator.alloc(u8, 1024);
     defer std.testing.allocator.free(wasm);
     const index = try std.testing.allocator.alloc(u8, 2048);

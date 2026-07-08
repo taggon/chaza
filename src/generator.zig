@@ -1,16 +1,17 @@
-//! chaza 생성기: JSON 코퍼스 → 인덱스 바이트 → 번들 바이트.
+//! chaza generator: JSON corpus → index bytes → bundle bytes.
 //!
-//! tinysearch 호환 JSON 문서 배열을 파싱하여:
-//! 1. 각 문서에서 title, url, 메타 필드 추출
-//! 2. indexed_fields 텍스트를 토큰화하여 고유 토큰 집합 생성
-//! 3. writer.IndexInput 구성 → 인덱스 바이트 직렬화
-//! 4. bundle.assemble로 [wasm][index][tailmeta] 번들 생성
+//! Parse tinysearch-compatible JSON document array:
+//! 1. Extract title, url, metadata fields from each document
+//! 2. Tokenize indexed_fields text to create unique token set
+//! 3. Configure writer.IndexInput → serialize index bytes
+//! 4. Generate [wasm][index][tailmeta] bundle via bundle.assemble
 
 const std = @import("std");
 const writer = @import("index/writer.zig");
 const bundle_mod = @import("bundle.zig");
 const tokenize = @import("pipeline/tokenize.zig");
 const stopwords = @import("pipeline/stopwords.zig");
+const prefix = @import("pipeline/prefix.zig");
 const reader = @import("index/reader.zig");
 const StopwordSet = stopwords.StopwordSet;
 
@@ -18,9 +19,13 @@ pub const GenerateOptions = struct {
     indexed_fields: []const []const u8 = &.{"title"},
     metadata_fields: []const []const u8 = &.{},
     url_field: []const u8 = "url",
-    /// 0 = 초성 비활성.
+    /// Fields whose words also get edge n-gram prefix tokens (0x02 marker,
+    /// length 2~8 codepoints) for search-as-you-type. Must be a subset of
+    /// indexed_fields. Empty disables prefix indexing.
+    prefix_fields: []const []const u8 = &.{"title"},
+    /// 0 = choseong disabled.
     choseong_max_len: u8 = 3,
-    /// 불용어 집합. null이면 불용어 제거 단계 생략.
+    /// Stopword set. null means skip stopwords removal stage.
     stopwords: ?StopwordSet = null,
 };
 
@@ -31,16 +36,25 @@ pub const GenerateResult = struct {
     index_size: usize,
 };
 
-/// corpus_json: tinysearch 호환 JSON 문서 배열.
-/// wasm_bytes: 빌드 시 @embedFile로 주입되는 runtime wasm (없으면 빈 바이트).
-/// allocator: 번들 바이트 할당용. 중간 할당은 내부 arena 사용.
+/// corpus_json: tinysearch-compatible JSON document array.
+/// wasm_bytes: runtime wasm injected via @embedFile at build time (empty if none).
+/// allocator: for bundle bytes allocation. Internal allocations use internal arena.
 pub fn generate(
     allocator: std.mem.Allocator,
     corpus_json: []const u8,
     wasm_bytes: []const u8,
     options: GenerateOptions,
 ) !GenerateResult {
-    // 중간 할당용 내부 arena — 함수 종료 시 전부 해제.
+    // prefix_fields ⊆ indexed_fields — prefix tokens on unindexed fields are meaningless
+    for (options.prefix_fields) |pf| {
+        var found = false;
+        for (options.indexed_fields) |f| {
+            if (std.mem.eql(u8, pf, f)) found = true;
+        }
+        if (!found) return error.PrefixFieldNotIndexed;
+    }
+
+    // Internal arena for intermediate allocations — all freed at function end.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -52,14 +66,14 @@ pub fn generate(
     if (parsed.value != .array) return error.NotAnArray;
     const docs_json = parsed.value.array.items;
 
-    // 2. 각 문서 → DocInput
+    // 2. Each document → DocInput
     const doc_inputs = try a.alloc(writer.DocInput, docs_json.len);
 
     for (docs_json, 0..) |doc_val, i| {
         if (doc_val != .object) return error.NotAnObject;
         const obj = doc_val.object;
 
-        // title — 항상 "title" 필드에서 가져옴
+        // title — always from "title" field
         const title: []const u8 = if (obj.get("title")) |v|
             (if (v == .string) v.string else "")
         else
@@ -71,30 +85,48 @@ pub fn generate(
         else
             "";
 
-        // 메타 값 — metadata_fields 순서대로, 숫자도 문자열화
+        // Meta values — in metadata_fields order, numbers stringified
         const meta_values = try a.alloc([]const u8, options.metadata_fields.len);
         for (options.metadata_fields, 0..) |mf, j| {
             meta_values[j] = if (obj.get(mf)) |v| try jsonValueToString(a, v) else "";
         }
 
-        // indexed_fields 텍스트를 합쳐 토큰화 → 고유 토큰 집합
+        // Concatenate indexed_fields text and tokenize → unique token set
         var token_set = std.StringHashMap(void).init(a);
         defer token_set.deinit();
         var token_list: std.ArrayList([]const u8) = .empty;
 
         for (options.indexed_fields) |field| {
+            const is_prefix_field = blk: {
+                for (options.prefix_fields) |pf| {
+                    if (std.mem.eql(u8, pf, field)) break :blk true;
+                }
+                break :blk false;
+            };
+
             if (obj.get(field)) |v| {
                 if (v == .string) {
                     var field_tokens: std.ArrayList([]const u8) = .empty;
                     try tokenize.tokenize(a, v.string, &field_tokens);
                     for (field_tokens.items) |tok| {
-                        // 파이프라인 3단계: 불용어 제거 (고유 토큰 수집·초성 생성 전)
+                        // Pipeline stage 3: stopwords removal (before unique token collection·choseong/prefix generation)
                         if (options.stopwords) |set| {
                             if (set.isStopword(tok)) continue;
                         }
                         if (!token_set.contains(tok)) {
                             try token_set.put(tok, {});
                             try token_list.append(a, tok);
+                        }
+                        // Edge n-gram prefix tokens (0x02) for prefix_fields words
+                        if (is_prefix_field) {
+                            var prefixes: std.ArrayList([]const u8) = .empty;
+                            try prefix.extractPrefixes(a, tok, &prefixes);
+                            for (prefixes.items) |p| {
+                                if (!token_set.contains(p)) {
+                                    try token_set.put(p, {});
+                                    try token_list.append(a, p);
+                                }
+                            }
                         }
                     }
                 }
@@ -109,17 +141,17 @@ pub fn generate(
         };
     }
 
-    // 3. IndexInput 구성
+    // 3. Configure IndexInput
     const input = writer.IndexInput{
         .meta_field_names = options.metadata_fields,
         .docs = doc_inputs,
         .choseong_max_len = options.choseong_max_len,
     };
 
-    // 4. 인덱스 바이트 직렬화
+    // 4. Serialize index bytes
     const index_bytes = try writer.write(a, input);
 
-    // 5. 번들 조립 — caller allocator로 할당 (caller free 대상)
+    // 5. Assemble bundle — allocated with caller allocator (caller free target)
     const bundle_bytes = try bundle_mod.assemble(allocator, wasm_bytes, index_bytes);
 
     return .{
@@ -129,7 +161,7 @@ pub fn generate(
     };
 }
 
-/// JSON 값을 문자열로 변환. 숫자(int/float)도 문자열화.
+/// Convert JSON values to string. Stringify number types (int/float) too.
 fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u8 {
     return switch (v) {
         .string => |s| s,
@@ -142,9 +174,9 @@ fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u
     };
 }
 
-// ── 단정 테스트 ────────────────────────────────────────────────────
+// ── Assertions ────────────────────────────────────────────────────
 
-test "단일 문서 JSON → generate → bundle 바이트 반환, open으로 wasm/index 분리" {
+test "Single document JSON → generate → return bundle bytes, open splits wasm/index" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"Hello World","url":"/hello","body":"hello world zig"}]
@@ -157,19 +189,19 @@ test "단일 문서 JSON → generate → bundle 바이트 반환, open으로 wa
     try std.testing.expectEqual(@as(usize, 1), result.num_docs);
     try std.testing.expect(result.index_size > 0);
 
-    // 번들 구조 검증 — wasm이 비어있으므로 wasm_len=0
+    // Verify bundle structure — wasm empty so wasm_len=0
     const view = try bundle_mod.open(result.bundle_bytes);
     try std.testing.expectEqual(@as(u32, 0), view.tail.wasm_len);
     try std.testing.expectEqual(@as(u32, @intCast(result.index_size)), view.tail.index_len);
 
-    // 인덱스 내용 검증
+    // Verify index content
     const idx = try reader.IndexView.open(view.index);
     try std.testing.expectEqual(@as(u32, 1), idx.header.num_docs);
     try std.testing.expectEqualStrings("Hello World", idx.title(0).?);
     try std.testing.expectEqualStrings("/hello", idx.url(0).?);
 }
 
-test "2문서 JSON, 메타 필드 2개" {
+test "2 document JSON, 2 meta fields" {
     const allocator = std.testing.allocator;
     const json =
         \\[
@@ -190,27 +222,27 @@ test "2문서 JSON, 메타 필드 2개" {
     try std.testing.expectEqual(@as(u32, 2), idx.header.num_docs);
     try std.testing.expectEqual(@as(u32, 2), idx.header.num_meta_fields);
 
-    // 메타 값 확인
+    // Verify meta values
     try std.testing.expectEqualStrings("alice", idx.metaValue(0, 0).?);
     try std.testing.expectEqualStrings("2026-01-01", idx.metaValue(0, 1).?);
     try std.testing.expectEqualStrings("bob", idx.metaValue(1, 0).?);
     try std.testing.expectEqualStrings("2026-02-02", idx.metaValue(1, 1).?);
 }
 
-test "빈 배열 JSON [] → num_docs=0" {
+test "Empty array JSON [] → num_docs=0" {
     const allocator = std.testing.allocator;
     const result = try generate(allocator, "[]", &.{}, .{});
     defer allocator.free(result.bundle_bytes);
 
     try std.testing.expectEqual(@as(usize, 0), result.num_docs);
-    try std.testing.expect(result.index_size > 0); // 헤더는 있음
+    try std.testing.expect(result.index_size > 0); // header exists
 
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
     try std.testing.expectEqual(@as(u32, 0), idx.header.num_docs);
 }
 
-test "잘못된 JSON → 에러 전파" {
+test "Invalid JSON → error propagate" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.NotAnArray, generate(allocator, "{}", &.{}, .{}));
     try std.testing.expectError(error.NotAnObject, generate(
@@ -219,9 +251,9 @@ test "잘못된 JSON → 에러 전파" {
     , &.{}, .{}));
 }
 
-test "choseong_max_len=0 vs 3 → 충분히 큰 코퍼스에서 번들 크기 다름" {
+test "choseong_max_len=0 vs 3 → bundle size differs on sufficient corpus" {
     const allocator = std.testing.allocator;
-    // 충분히 많은 고유 한글 토큰 (fuse blob 크기가 키 수에 비례하도록)
+    // Sufficient unique Korean tokens (so fuse blob size proportional to key count)
     const json =
         \\[{"title":"강나루 새로운 아침 바람","url":"/a","body":"산책 하늘 구름 비 올 비행기 자동차 기차 버스 정거장 학교 교실 의자 책상 연필 지우개 공책 가방 우산 손수건"},{"title":"바다 갈매기 배 여행","url":"/b","body":"섬 등대 항구 어부 그물 물개 파도 모래 조개 해초 갯벌 등껍질 조류 파도 보트 요트 돛 닻 나침반"}]
     ;
@@ -238,11 +270,11 @@ test "choseong_max_len=0 vs 3 → 충분히 큰 코퍼스에서 번들 크기 �
     });
     defer allocator.free(result_on.bundle_bytes);
 
-    // 초성 토큰 추가 → 더 많은 키 → 더 큰 fuse blob → 더 큰 인덱스
+    // Choseong tokens added → more keys → larger fuse blob → larger index
     try std.testing.expect(result_on.index_size > result_off.index_size);
 }
 
-test "숫자 메타 값 (views: 1000)이 문자열 '1000'으로 저장" {
+test "Number meta value (views: 1000) stored as string '1000'" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"Post","url":"/p","views":1000}]
@@ -257,7 +289,7 @@ test "숫자 메타 값 (views: 1000)이 문자열 '1000'으로 저장" {
     try std.testing.expectEqualStrings("1000", idx.metaValue(0, 0).?);
 }
 
-test "metadata_fields에 지정하지 않은 필드는 무시됨" {
+test "Fields not in metadata_fields ignored" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"T","url":"/u","extra":"should_be_ignored","views":42}]
@@ -272,7 +304,7 @@ test "metadata_fields에 지정하지 않은 필드는 무시됨" {
     try std.testing.expectEqual(@as(u32, 0), idx.header.num_meta_fields);
 }
 
-test "url_field가 없는 문서 → 빈 문자열로 저장 (에러 안 남)" {
+test "Document without url_field → stored as empty string (no error)" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"No URL","path":"/some-path"}]
@@ -290,7 +322,7 @@ test "url_field가 없는 문서 → 빈 문자열로 저장 (에러 안 남)" {
     try std.testing.expectEqualStrings("No URL", idx.title(0).?);
 }
 
-test "wasm 바이트가 번들에 포함됨" {
+test "wasm bytes included in bundle" {
     const allocator = std.testing.allocator;
     const fake_wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0xDE, 0xAD, 0xBE, 0xEF };
     const json =
@@ -304,7 +336,7 @@ test "wasm 바이트가 번들에 포함됨" {
     try std.testing.expectEqual(@as(u32, 8), view.tail.wasm_len);
 }
 
-test "indexed_fields의 텍스트가 토큰화되어 필터에 존재" {
+test "Text in indexed_fields tokenized and exists in filter" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"Zig Tutorial","url":"/zig","body":"learn zig wasm"}]
@@ -317,7 +349,7 @@ test "indexed_fields의 텍스트가 토큰화되어 필터에 존재" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    // title + body 토큰이 binary fuse filter에 있어야 함
+    // title + body tokens should be in binary fuse filter
     const binary_fuse = @import("pipeline/binary_fuse.zig");
     const hash = @import("pipeline/hash.zig");
     const filter_bytes = idx.docFilter(0).?;
@@ -328,7 +360,7 @@ test "indexed_fields의 텍스트가 토큰화되어 필터에 존재" {
     try std.testing.expect(fuse.contains(hash.key64("wasm")));
 }
 
-test "여러 indexed_field의 텍스트가 합쳐져 토큰화됨" {
+test "Text from multiple indexed_fields concatenated and tokenized" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"Alpha Beta","url":"/ab","body":"Gamma Delta"}]
@@ -345,15 +377,15 @@ test "여러 indexed_field의 텍스트가 합쳐져 토큰화됨" {
     const hash = @import("pipeline/hash.zig");
     const filter_bytes = idx.docFilter(0).?;
     const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
-    // title 토큰
+    // title tokens
     try std.testing.expect(fuse.contains(hash.key64("alpha")));
     try std.testing.expect(fuse.contains(hash.key64("beta")));
-    // body 토큰
+    // body tokens
     try std.testing.expect(fuse.contains(hash.key64("gamma")));
     try std.testing.expect(fuse.contains(hash.key64("delta")));
 }
 
-test "중복 토큰은 한 번만 필터에 추가됨" {
+test "Duplicate tokens added to filter only once" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"hello hello","url":"/h","body":"hello world"}]
@@ -363,19 +395,103 @@ test "중복 토큰은 한 번만 필터에 추가됨" {
     });
     defer allocator.free(result.bundle_bytes);
 
-    // "hello"가 title에 2번, body에 1번 나오지만 중복 제거로 1개 토큰
-    // 에러 없이 생성되면 충분 — 정확한 토큰 수는 bloom 크기로 간접 검증
+    // "hello" appears twice in title, once in body, but deduplicated to 1 token
+    // Success without error sufficient — exact token count indirectly verified via bloom size
     try std.testing.expectEqual(@as(usize, 1), result.num_docs);
 }
 
-test "불용어 집합 있을 때: 해당 토큰이 제거되어 인덱스가 작아짐" {
+test "prefix_fields default (title): title-word prefixes in filter, body-word prefixes absent" {
     const allocator = std.testing.allocator;
-    // 12개 고유 Latin 토큰 (bloom m이 64비트 하한을 넘어 토큰 수에 비례)
+    const json =
+        \\[{"title":"Programming Guide","url":"/p","body":"tutorial content"}]
+    ;
+    const result = try generate(allocator, json, &.{}, .{
+        .indexed_fields = &.{ "title", "body" },
+    });
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    const idx = try reader.IndexView.open(view.index);
+
+    const binary_fuse = @import("pipeline/binary_fuse.zig");
+    const hash = @import("pipeline/hash.zig");
+    const filter_bytes = idx.docFilter(0).?;
+    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
+
+    // title word 'programming' → \x02pr .. \x02programm (k=2..8)
+    try std.testing.expect(fuse.contains(hash.key64("\x02pr")));
+    try std.testing.expect(fuse.contains(hash.key64("\x02progr")));
+    try std.testing.expect(fuse.contains(hash.key64("\x02programm")));
+    // proper prefixes only — full word never gets a prefix token
+    try std.testing.expect(!fuse.contains(hash.key64("\x02programming")));
+    // body word 'tutorial' indexed exactly but gets no prefix tokens
+    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
+    try std.testing.expect(!fuse.contains(hash.key64("\x02tut")));
+}
+
+test "prefix_fields=[] disables prefix tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[{"title":"Programming Guide","url":"/p"}]
+    ;
+    const result = try generate(allocator, json, &.{}, .{
+        .prefix_fields = &.{},
+    });
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    const idx = try reader.IndexView.open(view.index);
+
+    const binary_fuse = @import("pipeline/binary_fuse.zig");
+    const hash = @import("pipeline/hash.zig");
+    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
+    try std.testing.expect(fuse.contains(hash.key64("programming")));
+    try std.testing.expect(!fuse.contains(hash.key64("\x02progr")));
+}
+
+test "prefix_fields not subset of indexed_fields → error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.PrefixFieldNotIndexed, generate(allocator, "[]", &.{}, .{
+        .indexed_fields = &.{"title"},
+        .prefix_fields = &.{"body"},
+    }));
+}
+
+test "stopworded words get no prefix tokens" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[{"title":"programming tutorial","url":"/p"}]
+    ;
+    var sw = try StopwordSet.fromFileBytes(allocator, "programming\n");
+    defer sw.deinit(allocator);
+
+    const result = try generate(allocator, json, &.{}, .{
+        .stopwords = sw,
+    });
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    const idx = try reader.IndexView.open(view.index);
+
+    const binary_fuse = @import("pipeline/binary_fuse.zig");
+    const hash = @import("pipeline/hash.zig");
+    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
+    // stopword removed before prefix generation
+    try std.testing.expect(!fuse.contains(hash.key64("programming")));
+    try std.testing.expect(!fuse.contains(hash.key64("\x02progr")));
+    // surviving word still gets prefixes
+    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
+    try std.testing.expect(fuse.contains(hash.key64("\x02tut")));
+}
+
+test "With stopword set: tokens removed → smaller index" {
+    const allocator = std.testing.allocator;
+    // 12 unique Latin tokens (bloom m > 64-bit lower bound, proportional to token count)
     const json =
         \\[{"title":"alpha beta","url":"/s","body":"gamma delta epsilon zeta eta theta iota kappa lambda mu"}]
     ;
 
-    // 불용어 4개: alpha, beta, gamma, delta → 제거 시 8 토큰
+    // 4 stopwords: alpha, beta, gamma, delta → after removal 8 tokens
     var sw = try StopwordSet.fromFileBytes(allocator, "alpha\nbeta\ngamma\ndelta\n");
     defer sw.deinit(allocator);
 
@@ -392,12 +508,12 @@ test "불용어 집합 있을 때: 해당 토큰이 제거되어 인덱스가 �
     });
     defer allocator.free(result_with.bundle_bytes);
 
-    // 12 토큰(m=104bit) vs 8 토큰(m=72bit) → 인덱스 크기 감소
+    // 12 tokens (m=104bit) vs 8 tokens (m=72bit) → index size decreased
     try std.testing.expectEqual(@as(usize, 1), result_without.num_docs);
     try std.testing.expect(result_with.index_size < result_without.index_size);
 }
 
-test "불용어 집합 null일 때: 아무 토큰도 제거 안 됨 (empty 집합과 동일)" {
+test "Stopword set null: no tokens removed (same as empty set)" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"the quick brown fox","url":"/s","body":"the an of to"}]
@@ -419,6 +535,6 @@ test "불용어 집합 null일 때: 아무 토큰도 제거 안 됨 (empty 집�
     });
     defer allocator.free(result_empty.bundle_bytes);
 
-    // null 경로(필터 스킵)와 빈 집합 경로(필터 통과, 0매칭)는 동일 결과
+    // null path (skip filter) and empty set path (filter pass, 0 matches) yield same result
     try std.testing.expectEqual(result_null.index_size, result_empty.index_size);
 }

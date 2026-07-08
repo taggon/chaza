@@ -1,9 +1,9 @@
-//! chaza 골든 테스트 — SPEC v1.1 (생성기·런타임 토큰화·해시 일치).
+//! chaza golden test — SPEC v1.1 (generator·runtime tokenization·hash consistency).
 //!
-//! 핵심 검증:
-//! 1. 생성기 결정론: 같은 입력 → 같은 index bytes.
-//! 2. 빌드-쿼리 토큰화 일치: 색인 시 토큰화한 토큰으로 search 시 매칭.
-//! 3. 대표 케이스 end-to-end 회귀 (한글·영어·초성·AND·정렬·제한).
+//! Core verification:
+//! 1. Generator determinism: same input → same index bytes.
+//! 2. Build-query tokenization consistency: tokens tokenized at index time match at search time.
+//! 3. Representative case end-to-end regression (Korean·English·choseong·OR ranking·limit).
 
 const std = @import("std");
 const generator = @import("generator.zig");
@@ -13,9 +13,8 @@ const runtime = @import("runtime.zig");
 const binary_fuse = @import("pipeline/binary_fuse.zig");
 const hash = @import("pipeline/hash.zig");
 const stopwords = @import("pipeline/stopwords.zig");
-const format = @import("index/format.zig");
 
-// ── 골든 코퍼스 (5문서, 한글+영어 혼합) ──
+// ── Golden corpus (5 documents, Korean+English mixed) ──
 //
 // doc 0: title="Hello World", body="hello world programming chaza"
 //   tokens: hello, world, programming, chaza
@@ -23,10 +22,10 @@ const format = @import("index/format.zig");
 //   tokens: zig, programming, wasm, fast, chaza
 // doc 2: title="안녕하세요", body="안녕하세요 친구 한글 chaza"
 //   tokens: 안녕하세요, 친구, 한글, chaza
-//   초성: ㅇ ㅇㄴ ㅇㄴㅎ (안녕하세요), ㅊ ㅊㄱ (친구), ㅎ ㅎㄱ (한글)
+//   choseong: ㅇ ㅇㄴ ㅇㄴㅎ (안녕하세요), ㅊ ㅊㄱ (친구), ㅎ ㅎㄱ (한글)
 // doc 3: title="Hello 안녕", body="hello 안녕 world chaza"
 //   tokens: hello, 안녕, world, chaza
-//   초성: ㅇ ㅇㄴ (안녕)
+//   choseong: ㅇ ㅇㄴ (안녕)
 // doc 4: title="Empty Body", body="chaza"
 //   tokens: empty, body, chaza
 //
@@ -49,7 +48,7 @@ const GOLDEN_OPTS = generator.GenerateOptions{
     .choseong_max_len = 3,
 };
 
-// 문서별 예상 토큰 (불용어 제거·중복 제거 후, 초성 토큰 제외)
+// Expected tokens per document (after stopwords removal·deduplication, excluding choseong tokens)
 const DocTokens = struct { doc_id: u32, tokens: []const []const u8 };
 const golden_doc_tokens = [_]DocTokens{
     .{ .doc_id = 0, .tokens = &.{ "hello", "world", "programming", "chaza" } },
@@ -59,17 +58,21 @@ const golden_doc_tokens = [_]DocTokens{
     .{ .doc_id = 4, .tokens = &.{ "empty", "body", "chaza" } },
 };
 
-// ── 헬퍼 ──
+// ── Helpers ──
 
 fn resultCount(ptr: [*]const u8) u32 {
     return std.mem.readInt(u32, ptr[0..4], .little);
 }
 
 fn resultDocId(ptr: [*]const u8, i: usize) u32 {
-    return std.mem.readInt(u32, ptr[4 + i * 4 ..][0..4], .little);
+    return std.mem.readInt(u32, ptr[4 + i * 8 ..][0..4], .little);
 }
 
-/// 결과 집합에 doc_id가 포함되어 있는지 확인.
+fn resultHits(ptr: [*]const u8, i: usize) u32 {
+    return std.mem.readInt(u32, ptr[8 + i * 8 ..][0..4], .little);
+}
+
+/// Check if result set contains doc_id.
 fn resultContains(ptr: [*]const u8, count: u32, doc_id: u32) bool {
     for (0..count) |i| {
         if (resultDocId(ptr, i) == doc_id) return true;
@@ -77,14 +80,14 @@ fn resultContains(ptr: [*]const u8, count: u32, doc_id: u32) bool {
     return false;
 }
 
-/// 골든 코퍼스로 bundle 생성. caller가 bundle_bytes free.
+/// Build bundle from golden corpus. caller free bundle_bytes.
 fn buildGolden(allocator: std.mem.Allocator) !generator.GenerateResult {
     return generator.generate(allocator, GOLDEN_JSON, &.{}, GOLDEN_OPTS);
 }
 
-// ── A. 결정론적 인덱스 생성 ──
+// ── A. Deterministic index generation ──
 
-test "골든 결정론: 같은 입력 두 번 → 동일 index bytes" {
+test "golden determinism: same input twice → identical index bytes" {
     const allocator = std.testing.allocator;
     const r1 = try buildGolden(allocator);
     defer allocator.free(r1.bundle_bytes);
@@ -98,7 +101,7 @@ test "골든 결정론: 같은 입력 두 번 → 동일 index bytes" {
     try std.testing.expectEqualSlices(u8, v1.index, v2.index);
 }
 
-test "골든 결정론: 다른 choseong_max_len → 다른 index bytes" {
+test "golden determinism: different choseong_max_len → different index bytes" {
     const allocator = std.testing.allocator;
 
     const r_off = try generator.generate(allocator, GOLDEN_JSON, &.{}, .{
@@ -113,11 +116,11 @@ test "골든 결정론: 다른 choseong_max_len → 다른 index bytes" {
 
     const v_off = try bundle_mod.open(r_off.bundle_bytes);
     const v_on = try bundle_mod.open(r_on.bundle_bytes);
-    // 초성 토큰 유무로 필터 지문 패턴이 달라야 함
+    // Filter fingerprint pattern differs due to choseong token presence
     try std.testing.expect(!std.mem.eql(u8, v_on.index, v_off.index));
 }
 
-test "골든 결정론: stopword 추가 → 다른 index bytes" {
+test "golden determinism: stopword added → different index bytes" {
     const allocator = std.testing.allocator;
     var sw = try stopwords.StopwordSet.fromFileBytes(allocator, "hello\n");
     defer sw.deinit(allocator);
@@ -135,13 +138,13 @@ test "골든 결정론: stopword 추가 → 다른 index bytes" {
 
     const v_sw = try bundle_mod.open(r_sw.bundle_bytes);
     const v_no = try bundle_mod.open(r_no.bundle_bytes);
-    // hello 제거 → 필터 지문 패턴 상이
+    // hello removed → filter fingerprint pattern different
     try std.testing.expect(!std.mem.eql(u8, v_sw.index, v_no.index));
 }
 
-// ── B. 빌드-쿼리 토큰화 일치 ──
+// ── B. Build-query tokenization consistency ──
 
-test "골든 일치: 모든 색인 토큰이 해당 문서 필터에 존재" {
+test "golden consistency: all indexed tokens exist in corresponding document filter" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -158,7 +161,7 @@ test "골든 일치: 모든 색인 토큰이 해당 문서 필터에 존재" {
     }
 }
 
-test "골든 일치: search('hello') → 토큰을 가진 문서만 hit (docs 0, 3)" {
+test "golden match: search('hello') → only documents with token hit (docs 0, 3)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -168,14 +171,14 @@ test "골든 일치: search('hello') → 토큰을 가진 문서만 hit (docs 0,
     defer runtime.testCleanup();
 
     const q = "hello";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
     try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
     try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
 }
 
-test "골든 일치: search('hello') → 토큰 없는 문서는 miss (docs 1, 2, 4)" {
+test "golden match: search('hello') → documents without token miss (docs 1, 2, 4)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -185,7 +188,7 @@ test "골든 일치: search('hello') → 토큰 없는 문서는 miss (docs 1, 2
     defer runtime.testCleanup();
 
     const q = "hello";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
     const count = resultCount(r);
 
     try std.testing.expect(!resultContains(r, count, 1));
@@ -193,9 +196,9 @@ test "골든 일치: search('hello') → 토큰 없는 문서는 miss (docs 1, 2
     try std.testing.expect(!resultContains(r, count, 4));
 }
 
-// ── C. 대표 케이스 골든 코퍼스 ──
+// ── C. Representative golden corpus cases ──
 
-test "골든: search('안녕') → doc 3만 hit (안녕 ≠ 안녕하세요)" {
+test "golden: search('안녕') → doc 3 (exact) + doc 2 (title prefix of 안녕하세요)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -204,14 +207,56 @@ test "골든: search('안녕') → doc 3만 hit (안녕 ≠ 안녕하세요)" {
     runtime.set_index(view.index.ptr, view.index.len);
     defer runtime.testCleanup();
 
+    // 안녕 exact hits doc 3. As the last (typed) token it also probes \x02안녕,
+    // which doc 2 carries from its title word 안녕하세요 (prefix_fields=title).
     const q = "안녕";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 1), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 2), resultCount(r));
+    try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
 }
 
-test "골든: search('ㅎ') → doc 2만 hit (한글로 시작하는 초성 ㅎ)" {
+test "golden prefix: search('hel') → title-word prefix hits docs 0, 3" {
+    const allocator = std.testing.allocator;
+    const result = try buildGolden(allocator);
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    runtime.set_index(view.index.ptr, view.index.len);
+    defer runtime.testCleanup();
+
+    // 'hel' exact matches nothing; prefix \x02hel comes from titles containing
+    // 'Hello' (docs 0, 3). doc 1's body has no prefix tokens (body ∉ prefix_fields).
+    const q = "hel";
+    const r = runtime.search(q.ptr, q.len, 0);
+
+    try std.testing.expectEqual(@as(u32, 2), resultCount(r));
+    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
+}
+
+test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
+    const allocator = std.testing.allocator;
+    const result = try buildGolden(allocator);
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    runtime.set_index(view.index.ptr, view.index.len);
+    defer runtime.testCleanup();
+
+    // 'programming' exists in doc 0/1 bodies and doc 1 title.
+    // 'progr' (5cp) probes \x02progr — generated only from title words:
+    // doc 1 title 'Zig Programming' → \x02progr exists → doc 1 hit.
+    // doc 0 has 'programming' only in body → no prefix token → miss.
+    const q = "progr";
+    const r = runtime.search(q.ptr, q.len, 0);
+
+    try std.testing.expectEqual(@as(u32, 1), resultCount(r));
+    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 0));
+}
+
+test "golden: search('ㅎ') → doc 2 only hit (ㅎ choseong starting word 한글)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -221,13 +266,13 @@ test "골든: search('ㅎ') → doc 2만 hit (한글로 시작하는 초성 ㅎ)
     defer runtime.testCleanup();
 
     const q = "ㅎ";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(r));
     try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 0));
 }
 
-test "골든: search('hello world') AND → docs 0, 3만 hit" {
+test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → input order)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -237,14 +282,14 @@ test "골든: search('hello world') AND → docs 0, 3만 hit" {
     defer runtime.testCleanup();
 
     const q = "hello world";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
     try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
     try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
 }
 
-test "골든: 빈 쿼리 → count=0" {
+test "golden: empty query → count=0" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -254,12 +299,12 @@ test "골든: 빈 쿼리 → count=0" {
     defer runtime.testCleanup();
 
     const q = "";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(r));
 }
 
-test "골든: 미존재 토큰 → count=0" {
+test "golden: non-existent token → count=0" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -269,14 +314,14 @@ test "골든: 미존재 토큰 → count=0" {
     defer runtime.testCleanup();
 
     const q = "zzznonexistentzzz";
-    const r = runtime.search(q.ptr, q.len, 0, -1, false);
+    const r = runtime.search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(r));
 }
 
-// ── D. 정렬 및 제한 ──
+// ── D. Ranking and limiting ──
 
-test "골든 정렬: date asc → 빠른 순 (3, 0, 1, 2, 4)" {
+test "golden ranking: 'hello programming' → doc 0 (2 hits) first, then partial matches (1, 3)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -285,19 +330,20 @@ test "골든 정렬: date asc → 빠른 순 (3, 0, 1, 2, 4)" {
     runtime.set_index(view.index.ptr, view.index.len);
     defer runtime.testCleanup();
 
-    const q = "chaza";
-    const r = runtime.search(q.ptr, q.len, 0, 1, false); // field_idx=1 (date), asc
+    const q = "hello programming";
+    const r = runtime.search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 5), resultCount(r));
-    // 2026-01-05(3), 2026-01-15(0), 2026-02-20(1), 2026-03-10(2), 2026-04-01(4)
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 1));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 2));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 3));
-    try std.testing.expectEqual(@as(u32, 4), resultDocId(r, 4));
+    // doc 0: hello+programming (hits 2). doc 1: programming (1). doc 3: hello (1).
+    try std.testing.expectEqual(@as(u32, 3), resultCount(r));
+    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 1));
+    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 2));
+    try std.testing.expectEqual(@as(u32, 2), resultHits(r, 0));
+    try std.testing.expectEqual(@as(u32, 1), resultHits(r, 1));
+    try std.testing.expectEqual(@as(u32, 1), resultHits(r, 2));
 }
 
-test "골든 정렬: date desc → 늦은 순 (4, 2, 1, 0, 3)" {
+test "golden ranking: unknown token doesn't kill partial matches ('hello zzznonexistentzzz')" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -306,48 +352,16 @@ test "골든 정렬: date desc → 늦은 순 (4, 2, 1, 0, 3)" {
     runtime.set_index(view.index.ptr, view.index.len);
     defer runtime.testCleanup();
 
-    const q = "chaza";
-    const r = runtime.search(q.ptr, q.len, 0, 1, true); // desc
+    const q = "hello zzznonexistentzzz";
+    const r = runtime.search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 5), resultCount(r));
-    // 2026-04-01(4), 2026-03-10(2), 2026-02-20(1), 2026-01-15(0), 2026-01-05(3)
-    try std.testing.expectEqual(@as(u32, 4), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 1));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 2));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 3));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 4));
+    // 'hello' docs (0, 3) survive with hits 1 — the unknown token no longer zeroes results
+    try std.testing.expectEqual(@as(u32, 2), resultCount(r));
+    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
 }
 
-test "골든 정렬: metaValue null인 문서는 맨 뒤" {
-    const allocator = std.testing.allocator;
-    const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
-
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
-
-    // doc 4의 date MetaEntry.off를 0xFFFFFFFF로 손상 → metaValue(4, 1) → null
-    const stride = format.docEntrySize(idx.header.num_meta_fields);
-    const meta_byte_off = @as(usize, idx.header.doc_table_off) +
-        4 * stride + @sizeOf(format.DocEntryPrefix) + @sizeOf(format.MetaEntry);
-    std.mem.writeInt(u32, result.bundle_bytes[meta_byte_off..][0..4], 0xFFFFFFFF, .little);
-
-    runtime.set_index(view.index.ptr, view.index.len);
-    defer runtime.testCleanup();
-
-    const q = "chaza";
-    const r = runtime.search(q.ptr, q.len, 0, 1, false); // date asc
-
-    try std.testing.expectEqual(@as(u32, 5), resultCount(r));
-    // doc 4는 null → 맨 뒤, 나머지는 날짜순: 3, 0, 1, 2
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 1));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 2));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 3));
-    try std.testing.expectEqual(@as(u32, 4), resultDocId(r, 4)); // null → 맨 뒤
-}
-
-test "골든: max_results=2 → 최대 2개 반환" {
+test "golden: max_results=2 → return max 2 (top-ranked first)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -357,10 +371,10 @@ test "골든: max_results=2 → 최대 2개 반환" {
     defer runtime.testCleanup();
 
     const q = "chaza";
-    const r = runtime.search(q.ptr, q.len, 2, -1, false);
+    const r = runtime.search(q.ptr, q.len, 2);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
-    // 입력 순: docs 0, 1
+    // All docs hits 1 → input order: docs 0, 1
     try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
     try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 1));
 }

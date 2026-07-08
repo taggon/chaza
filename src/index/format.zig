@@ -1,50 +1,59 @@
-//! chaza 인덱스 바이너리 포맷 (SPEC v1.2 참조).
+//! chaza index binary format
 //!
-//! 설계 원칙: 평면(flat), zero-parse, 리틀엔디안, 4바이트 정렬.
+//! Design principles: flat, zero-parse, little-endian, 4-byte alignment.
 //!
-//! 메모리 배치:
+//! Memory layout:
 //!   [ Header ]
-//!   [ 메타 필드 이름 목록 ]   num_meta_fields 개의 NUL 종료 UTF-8 문자열
-//!   [ 문서 메타 테이블 ]       num_docs 개의 DocEntry (가변: 24 + 8*num_meta_fields 바이트)
-//!   [ 문자열 풀 ]             title / url / 메타 값 문자열 (NUL 구분)
-//!   [ 필터 데이터 ]           각 문서의 필터 blob ([FuseBlobHeader][fingerprints])
+//!   [ Meta field name list ]   num_meta_fields NUL-terminated UTF-8 strings
+//!   [ Document metadata table ]   num_docs DocEntry (variable: 24 + 8*num_meta_fields bytes)
+//!   [ String pool ]             title / url / meta value strings (NUL-delimited)
+//!   [ Filter data ]           Each document's filter blob ([FuseBlobHeader][fingerprints])
 //!
-//! 번들 파일은 [ runtime.wasm ][ index bytes ][ TailMeta 16B ] 순서.
+//! Bundle file order: [ runtime.wasm ][ index bytes ][ TailMeta 16B ]
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// 번들 식별용 매직넘버. 파일에 LE로 직렬화하면 바이트 순서가 'C','H','A','Z'가 됨.
+/// Bundle magic number. Serialized to file as LE gives byte order 'C','H','A','Z'.
 pub const MAGIC: u32 = 0x5A414843;
 
-/// 현재 인덱스 포맷 버전. v1.2에서 version 2 (필터 blob 자기서술 구조).
+/// Current index format version. Filter blobs are self-describing.
 pub const VERSION: u8 = 2;
 
-/// 초성 토큰임을 나타내는 접두 바이트.
+/// Prefix byte indicating choseong token.
 pub const CHOSEONG_MARKER: u8 = 0x01;
+
+/// Marker byte prepended to edge n-gram prefix tokens (prefix_fields).
+pub const PREFIX_MARKER: u8 = 0x02;
 
 pub const HEADER_SIZE: usize = @sizeOf(Header);
 pub const TAIL_META_SIZE: usize = @sizeOf(TailMeta);
 
-/// 1계층 토큰화 알고리즘 (헤더의 tokenizer_kind 필드).
+/// 1-layer tokenization algorithm (header's tokenizer_kind field).
 pub const TokenizerKind = enum(u8) {
     default = 0,
     _,
 };
 
-/// 필터 종류 (헤더의 filter_kind 필드).
+/// Filter type (header's filter_kind field).
+///
+/// Format-level reservation for future filter kinds — only binary_fuse is
+/// implemented. Bloom (the original v1.0 filter) and xor were dropped in
+/// SPEC v1.2: BinaryFuse8 subsumes both (smaller, faster, lower FP rate),
+/// so no fallback exists. Writer always emits binary_fuse; reader/runtime
+/// assume it. A future kind needs its own blob layout + runtime dispatch.
 pub const FilterKind = enum(u8) {
     binary_fuse = 0,
     _,
 };
 
-/// 인덱스 헤더 (32바이트, 4바이트 정렬).
-/// 모든 offset은 인덱스 바이트 선두 기준.
+/// Index header (32 bytes, 4-byte aligned).
+/// All offsets relative to index byte start.
 pub const Header = extern struct {
     magic: u32 = MAGIC,
     version: u8 = VERSION,
     filter_kind: FilterKind = .binary_fuse,
-    /// Bloom 전용 k (BinaryFuse는 미사용, 0).
+    /// Reserved for Bloom filter k; unused (0) with BinaryFuse.
     hash_k: u8 = 0,
     tokenizer_kind: TokenizerKind = .default,
     num_docs: u32 = 0,
@@ -55,28 +64,28 @@ pub const Header = extern struct {
     filters_off: u32 = 0,
 };
 
-/// 문서 메타 테이블 항목의 고정 접두부 (24바이트).
-/// 이어서 num_meta_fields 개의 MetaEntry가 옴.
+/// Document metadata table entry fixed prefix (24 bytes).
+/// Followed by num_meta_fields MetaEntries.
 pub const DocEntryPrefix = extern struct {
-    /// 이 문서 필터 blob의 오프셋 (filters 구역 기준).
+    /// This document's filter blob offset (filters section relative).
     filter_off: u32 = 0,
-    /// 필터 blob 전체 길이 (헤더 포함).
+    /// Filter blob total length (including header).
     filter_len: u32 = 0,
-    /// 문서 제목 (string_pool 기준).
+    /// Document title (string_pool relative).
     title_off: u32 = 0,
     title_len: u32 = 0,
-    /// 문서 URL (string_pool 기준).
+    /// Document URL (string_pool relative).
     url_off: u32 = 0,
     url_len: u32 = 0,
 };
 
-/// DocEntry의 메타 값 위치 (문자열 풀 내).
+/// Meta value position within DocEntry (within string pool).
 pub const MetaEntry = extern struct {
     off: u32 = 0,
     len: u32 = 0,
 };
 
-/// 번들 꼬리 메타 (16바이트 고정, 파일 맨 끝).
+/// Bundle tail metadata (16 bytes fixed, file end).
 pub const TailMeta = extern struct {
     magic: u32 = MAGIC,
     version: u8 = VERSION,
@@ -85,12 +94,12 @@ pub const TailMeta = extern struct {
     index_len: u32 = 0,
 };
 
-/// 한 DocEntry의 총 바이트 크기. = 24 + 8 * num_meta_fields.
+/// Total byte size of one DocEntry. = 24 + 8 * num_meta_fields.
 pub inline fn docEntrySize(num_meta_fields: u32) usize {
     return @sizeOf(DocEntryPrefix) + @as(usize, num_meta_fields) * @sizeOf(MetaEntry);
 }
 
-/// DocEntryPrefix 포인터 뒤에 이어지는 메타 엔트리들을 슬라이스로 얻음.
+/// Returns the MetaEntry array that follows the DocEntryPrefix as a slice.
 pub fn metaEntries(prefix: *DocEntryPrefix, num_meta_fields: usize) []MetaEntry {
     const prefix_bytes: [*]u8 = @ptrCast(prefix);
     const after: [*]u8 = prefix_bytes + @sizeOf(DocEntryPrefix);
@@ -98,14 +107,14 @@ pub fn metaEntries(prefix: *DocEntryPrefix, num_meta_fields: usize) []MetaEntry 
     return meta_ptr[0..num_meta_fields];
 }
 
-// ── 단정 테스트 ────────────────────────────────────────────────────
+// ── Assertion tests ────────────────────────────────────────────────────
 
-test "매직넘버가 ASCII 'CHAZ' 리틀엔디안과 일치" {
+test "magic number matches ASCII 'CHAZ' little-endian" {
     const bytes: [4]u8 = .{ 'C', 'H', 'A', 'Z' };
     try std.testing.expectEqual(MAGIC, std.mem.readInt(u32, &bytes, .little));
 }
 
-test "Header 크기 및 오프셋 (SPEC 준수)" {
+test "Header size and offsets (SPEC compliant)" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(Header));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(Header));
 
@@ -122,7 +131,7 @@ test "Header 크기 및 오프셋 (SPEC 준수)" {
     try std.testing.expectEqual(@as(usize, 28), @offsetOf(Header, "filters_off"));
 }
 
-test "DocEntryPrefix / MetaEntry 크기" {
+test "DocEntryPrefix / MetaEntry sizes" {
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(DocEntryPrefix));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(MetaEntry));
 
@@ -137,13 +146,13 @@ test "DocEntryPrefix / MetaEntry 크기" {
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(MetaEntry, "len"));
 }
 
-test "docEntrySize 계산" {
+test "docEntrySize calculation" {
     try std.testing.expectEqual(@as(usize, 24), docEntrySize(0));
     try std.testing.expectEqual(@as(usize, 32), docEntrySize(1));
     try std.testing.expectEqual(@as(usize, 48), docEntrySize(3));
 }
 
-test "TailMeta 크기 및 오프셋 (16바이트 고정)" {
+test "TailMeta size and offsets (16 bytes fixed)" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(TailMeta));
     try std.testing.expectEqual(@as(usize, 4), @alignOf(TailMeta));
 
@@ -154,11 +163,11 @@ test "TailMeta 크기 및 오프셋 (16바이트 고정)" {
     try std.testing.expectEqual(@as(usize, 12), @offsetOf(TailMeta, "index_len"));
 }
 
-test "리틀엔디안 호스트 가정 (wasm 네이티브 = 리틀엔디안)" {
+test "little-endian host assumed (wasm native = little-endian)" {
     try std.testing.expectEqual(.little, builtin.cpu.arch.endian());
 }
 
-test "Header 기본값" {
+test "Header defaults" {
     const h: Header = .{};
     try std.testing.expectEqual(MAGIC, h.magic);
     try std.testing.expectEqual(VERSION, h.version);
@@ -168,16 +177,16 @@ test "Header 기본값" {
     try std.testing.expectEqual(@as(u32, 0), h.num_docs);
 }
 
-test "metaEntries 슬라이싱" {
-    // DocEntryPrefix(24바이트) + MetaEntry 3개(24바이트) = 48바이트
+test "metaEntries slicing" {
+    // DocEntryPrefix (24 bytes) + 3 MetaEntry (24 bytes) = 48 bytes
     var storage: [48]u8 = .{0} ** 48;
     const prefix: *DocEntryPrefix = @ptrCast(@alignCast(&storage));
 
-    // 접두부 채우기
+    // Fill prefix
     prefix.filter_off = 100;
     prefix.title_len = 42;
 
-    // 메타 엔트리 3개 채우기
+    // Fill 3 meta entries
     const metas = metaEntries(prefix, 3);
     try std.testing.expectEqual(@as(usize, 3), metas.len);
     metas[0].off = 1;
@@ -185,7 +194,7 @@ test "metaEntries 슬라이싱" {
     metas[2].off = 9;
     metas[2].len = 10;
 
-    // 실제 바이트가 접두부 뒤(offset 24)에 놓였는지 확인
+    // Verify actual bytes placed after prefix (offset 24)
     // metas[0].off @ 24, metas[2].len @ 24 + 2*8 + 4 = 44
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, storage[24..28], .little));
     try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, storage[44..48], .little));

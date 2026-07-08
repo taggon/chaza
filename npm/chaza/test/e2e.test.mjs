@@ -50,17 +50,27 @@ describe("e2e: single-token search", () => {
   });
 });
 
-describe("e2e: multi-token AND", () => {
-  test("대한민국 민법 → 1 hit (intersection)", () => {
+describe("e2e: multi-token OR ranking", () => {
+  test("대한민국 민법 → all-token match ranks first, partial matches follow", () => {
     const results = chaza.search("대한민국 민법");
-    assert.equal(results.length, 1);
+    // Union of 대한민국 docs (4) and 민법 docs; both-token doc first.
+    assert.ok(results.length >= 4);
     assert.equal(results[0].title, "대한민국 민법 제157조");
+    assert.equal(results[0].hits, 2);
+    assert.equal(results[1].hits, 1);
   });
 
-  test("올림픽 사격 → 1 hit", () => {
+  test("올림픽 사격 → both-token doc first", () => {
     const results = chaza.search("올림픽 사격");
-    assert.equal(results.length, 1);
+    assert.ok(results.length >= 4);
     assert.ok(results[0].title.includes("올림픽"));
+    assert.ok(results[0].title.includes("사격"));
+  });
+
+  test("unknown token doesn't kill partial matches", () => {
+    const results = chaza.search("민법 xyzqwert");
+    assert.equal(results.length, 1);
+    assert.equal(results[0].title, "대한민국 민법 제157조");
   });
 });
 
@@ -78,6 +88,20 @@ describe("e2e: choseong search", () => {
   });
 });
 
+describe("e2e: prefix search (title words)", () => {
+  test("newj → NewJeans title via prefix token", () => {
+    // some() not exact count: with 50 docs a ~0.4%/doc false positive
+    // occasionally adds an extra hit (inherent to the filter).
+    const results = chaza.search("newj");
+    assert.ok(results.some((r) => r.title === "NewJeans 라이브 공연 목록"));
+  });
+
+  test("대한 → title starting with 대한민국 matched by prefix", () => {
+    const results = chaza.search("대한");
+    assert.ok(results.some((r) => r.title === "대한민국 민법 제157조"));
+  });
+});
+
 describe("e2e: empty results", () => {
   test("non-existent token → 0 hits", () => {
     const results = chaza.search("xyzqwert");
@@ -85,36 +109,15 @@ describe("e2e: empty results", () => {
   });
 });
 
-describe("e2e: sorting", () => {
-  test("sort by path ascending", () => {
-    const results = chaza.search("대한민국", {
-      sortFieldIdx: 0,
-      sortDesc: false,
-    });
-    assert.equal(results.length, 4);
+describe("e2e: ranking order", () => {
+  test("single-token ties keep document input order", () => {
+    const results = chaza.search("대한민국");
     assert.deepEqual(
       results.map((r) => r.title),
       [
-        "김정주 (기업인)",
         "대한민국 민법 제157조",
         "천안백석중학교",
         "NewJeans 라이브 공연 목록",
-      ],
-    );
-  });
-
-  test("sort by path descending", () => {
-    const results = chaza.search("대한민국", {
-      sortFieldIdx: 0,
-      sortDesc: true,
-    });
-    assert.equal(results.length, 4);
-    assert.deepEqual(
-      results.map((r) => r.title),
-      [
-        "NewJeans 라이브 공연 목록",
-        "천안백석중학교",
-        "대한민국 민법 제157조",
         "김정주 (기업인)",
       ],
     );
@@ -138,7 +141,7 @@ describe("e2e: maxResults", () => {
 });
 
 describe("e2e: result structure", () => {
-  test("result has title, url, meta", () => {
+  test("result has title, url, meta, hits", () => {
     const results = chaza.search("민법");
     assert.equal(results.length, 1);
     const r = results[0];
@@ -146,5 +149,6 @@ describe("e2e: result structure", () => {
     assert.equal(typeof r.url, "string");
     assert.ok(r.meta);
     assert.equal(typeof r.meta.path, "string");
+    assert.equal(r.hits, 1);
   });
 });

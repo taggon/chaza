@@ -1,5 +1,5 @@
-//! chaza — 초성으로도 찾아주는 아주 작은 정적 사이트 검색 엔진.
-//! 모듈 루트: 하위 모듈을 재노출.
+//! chaza — tiny static site search engine that finds by choseong.
+//! Module root: re-export sub-modules.
 const std = @import("std");
 
 pub const index = struct {
@@ -15,6 +15,7 @@ pub const pipeline = struct {
     pub const tokenize = @import("pipeline/tokenize.zig");
     pub const binary_fuse = @import("pipeline/binary_fuse.zig");
     pub const choseong = @import("pipeline/choseong.zig");
+    pub const prefix = @import("pipeline/prefix.zig");
     pub const stopwords = @import("pipeline/stopwords.zig");
 };
 
@@ -24,7 +25,7 @@ pub const generator = @import("generator.zig");
 pub const golden_test = @import("golden_test.zig");
 
 test {
-    // 하위 모듈의 test 블록이 분석 대상에 포함되도록 강제.
+    // Force sub-module test blocks to be included in analysis target.
     _ = index.format;
     _ = index.writer;
     _ = index.reader;
@@ -34,6 +35,7 @@ test {
     _ = pipeline.tokenize;
     _ = pipeline.binary_fuse;
     _ = pipeline.choseong;
+    _ = pipeline.prefix;
     _ = pipeline.stopwords;
     _ = bundle;
     _ = runtime;
