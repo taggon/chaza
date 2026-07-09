@@ -1,13 +1,27 @@
-# chaza
+# Chaza
 
 A minimal static-site search engine — Zig + WASM. Finds Korean text even when you type only initial consonants (choseong).
 
-## Why?
-
 - **Small.** The index stores binary fuse filters, not document text. ~0.5 MB for a few hundred pages.
 - **Korean choseong search.** Type ㄱㄴ and match 가나, 강남, 경남…
-- **All query work in WASM.** Tokenization, hashing, lookup, ranking — all in the bundled WASM module. JavaScript only passes strings and renders results.
+- **All query work in WASM.** JavaScript only passes strings and renders results.
 - **No toolchain for end users.** The runtime WASM is embedded in the CLI binary. Building an index is just byte concatenation — no compiler needed.
+
+## vs tinysearch
+
+Chaza is inspired by [tinysearch](https://github.com/tinysearch/tinysearch) and reads the same corpus format. Same 100-document Wikipedia corpus (50 Korean + 50 English), Apple M1 Max, Node v22 — reproduce with [`bench/`](bench/):
+
+| | chaza | tinysearch 0.10 | |
+|---|---|---|---|
+| Index build time | **4.7 ms** | 4.6 s¹ | ~1,000× faster |
+| Search latency (Node, 2,000 queries) | **4.6 µs/query** | 316 µs/query | ~70× faster |
+| Output size (raw) | 38 KB bundle + 12 KB loader | 142 KB wasm + 2 KB glue | ~3× smaller |
+| Output size (gzip) | **14 KB** + 4 KB loader | 68 KB + 1 KB glue | ~4× smaller |
+| Korean choseong search | ✅ | ❌ | |
+| Single binary, no toolchain | ✅ | ❌ needs Rust + wasm toolchain² | |
+
+¹ With a warm cargo cache — tinysearch generates and compiles a Rust crate on every index build. The first-ever build also compiles dependencies (minutes).
+² `rustc`, `wasm32-unknown-unknown` target, and `binaryen` at index-build time. Chaza ships the pre-built runtime inside the CLI binary.
 
 ## Install
 
@@ -74,7 +88,7 @@ Options:
 [
   {
     "title": "Post Title",
-    "url": "https://example.com/post",
+    "url": "https://example.com/posts/1",
     "body": "Full text to index (not stored in the output)",
     "path": "/posts/1",
     "date": "2026-01-01"
@@ -96,6 +110,7 @@ Numbers are stringified automatically.
   "schema": {
     "indexed_fields": ["title", "body"],
     "metadata_fields": ["path", "date"],
+    "prefix_fields": ["title"],
     "url_field": "url"
   },
   "korean": {
@@ -116,62 +131,22 @@ Numbers are stringified automatically.
 
 ## Search behavior
 
-- **Multi-token queries are OR with hit-count ranking.** Any document matching at least one token is a candidate; documents matching more tokens rank higher, so all-token (AND) matches come first. Ties keep document input order.
-- **Each result carries `hits`** — the number of query tokens that matched (range 0~16). Use it to badge strong matches or post-filter weak ones.
-- **At most 16 query tokens are considered.** Tokens beyond the 16th are ignored (bounds false-positive noise and lookup cost).
-- **The last query token also matches by prefix.** While typing, the last token (2–8 chars) matches words in `prefix_fields` (default: title) that start with it — `progr` finds a title containing "Programming". Other fields still need exact word matches.
-- **Choseong tokens work like regular tokens.** A query `ㅅㅈ` matches any document whose indexed text contains a word starting with those initial consonants.
-- **`max_results`** defaults to 20; pass 0 for the default.
-
-```js
-chaza.search("hello", { maxResults: 10 });
-```
-
-### Sorting
-
-Results are always ordered by matched-token count, descending. If you need a different order (date, etc.), sort the returned array in JavaScript — it holds at most `max_results` entries, so the cost is negligible.
-
-## How it works
-
-### Tokenization pipeline (shared by indexer and runtime)
-
-1. Lowercase (ASCII A–Z)
-2. Segment by script group (Latin, Hangul, Han, Hiragana, Katakana, Number)
-3. Remove stopwords (`--stopwords` file)
-4. Deduplicate per document
-5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 1–`choseong_max_len`
-6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints
-7. Deduplicate again
-
-The indexer and runtime share the same Zig tokenization code — bit-level consistency is guaranteed.
-
-**Stopwords are removed at index time only.** The stopword list is not shipped in the bundle, so the runtime cannot filter them from queries — a stopword never matches any document. If only some query tokens are stopwords, the remaining tokens still match (OR ranking); **if every token is a stopword, the result is empty.**
-
-### Filter: Binary Fuse (BinaryFuse8)
-
-Each document gets its own [binary fuse filter](https://arxiv.org/abs/2201.01174) — a static, probabilistic set with ~0.4% false-positive rate (8-bit fingerprints, 3 fixed probes per lookup). Roughly **9 bits per token**.
-
-Token → xxhash64 → 64-bit key → binary fuse internal hash → 3 positions + fingerprint XOR.
-
-The filter is the only representation stored. No original text or tokens are kept.
-
-### Bundle format
-
-```
-[runtime.wasm][index bytes][tail-meta 16 B]
-```
-
-The tail meta stores `wasm_len` and `index_len` (little-endian). The loader reads the last 16 bytes, slices the WASM and index sections, instantiates the WASM, and injects the index.
-
-`chaza.bundle` is **not a valid WASM module** — it must be loaded through `chaza.js`.
+- **Multi-token queries are OR with hit-count ranking** — documents matching more tokens come first; each result carries the count as `hits`.
+- **The last query token also matches by prefix** (2–8 chars) against `prefix_fields` words — `progr` finds a title containing "Programming".
+- **Choseong queries** like `ㅅㅈ` match documents with a word starting with those initial consonants.
+- **`max_results`** defaults to 20: `chaza.search("hello", { maxResults: 10 })`. Results are ordered by `hits`; for other orders (date, etc.), sort the returned array in JavaScript.
 
 ## Limitations
 
-- **Input must be UTF-8 + NFC.** NFD (decomposed) Hangul will break choseong extraction.
-- **No metadata sorting.** Results are fixed to matched-token-count order. Sort the returned array in JavaScript for other orders.
-- **Stopwords are not searchable.** They are removed from the index, so a query made up entirely of stopwords returns nothing.
-- **Static index.** No incremental updates. Rebuild from the corpus to add/remove documents.
-- **False positives.** ~0.4% of queries may match a document that doesn't actually contain the token. There is no brute-force verification step.
+- **Input must be UTF-8 + NFC.** NFD (decomposed) Hangul breaks choseong extraction.
+- **False positives.** ~0.4% of lookups may match a document that doesn't contain the token — inherent to the filter. Practical corpus ceiling is a few thousand documents.
+- **Static index.** No incremental updates; rebuild to add or remove documents.
+- **Stopwords are not searchable.** A query made up entirely of stopwords returns nothing.
+
+## Documentation
+
+- [How it works](docs/how-it-works.md) — tokenization pipeline, choseong/prefix tokens, binary fuse filters, bundle format, size limits
+- [SPEC.md](SPEC.md) — full format and behavior specification
 
 ## Acknowledgements
 

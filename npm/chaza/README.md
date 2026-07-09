@@ -1,4 +1,4 @@
-# chaza
+# Chaza
 
 A minimal static-site search engine — Zig + WASM. Finds Korean text even when you type only initial consonants (choseong).
 
@@ -15,12 +15,6 @@ Type `ㄱㄴ` and match 가나, 강남, 경남… All query work runs in a bundl
 
 ```bash
 npm install chaza
-```
-
-Or install the standalone binary via shell:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/taggon/chaza/main/scripts/install.sh | sh
 ```
 
 Platform binaries are auto-selected for macOS and Linux (x64, arm64).
@@ -64,7 +58,7 @@ The corpus is a JSON array of documents (tinysearch-compatible):
 [
   {
     "title": "Post Title",
-    "url": "https://example.com/post",
+    "url": "https://example.com/posts/1",
     "body": "Full text to index (not stored in the output)",
     "path": "/posts/1",
     "date": "2026-01-01"
@@ -144,39 +138,10 @@ Options:
   -h, --help               Show this help
 ```
 
-## How it works
+## Documentation
 
-### Tokenization pipeline
-
-The indexer and runtime share the same Zig tokenization code, so bit-level consistency is guaranteed:
-
-1. Lowercase (ASCII A–Z)
-2. Segment by script group (Latin, Hangul, Han, Hiragana, Katakana, Number)
-3. Remove stopwords (`--stopwords` file)
-4. Deduplicate per document
-5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 1–`choseong_max_len`
-6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints
-7. Deduplicate again
-
-### Filter: Binary Fuse (BinaryFuse8)
-
-Each document gets its own [binary fuse filter](https://arxiv.org/abs/2201.01174) — a static, probabilistic set with a ~0.4% false-positive rate (8-bit fingerprints, 3 fixed probes per lookup). Roughly **9 bits per token**.
-
-```
-Token → xxhash64 → 64-bit key → binary fuse hash → 3 positions + fingerprint XOR
-```
-
-The filter is the only representation stored. No original text or tokens are kept.
-
-### Bundle format
-
-```
-[runtime.wasm][index bytes][tail-meta 16 B]
-```
-
-The tail meta stores `wasm_len` and `index_len` (little-endian). The loader reads the last 16 bytes, slices the WASM and index sections, instantiates the WASM, and injects the index.
-
-`chaza.bundle` is **not a valid WASM module** — it must be loaded through `chaza.js`.
+- [How it works](https://github.com/taggon/chaza/blob/main/docs/how-it-works.md) — tokenization pipeline, choseong/prefix tokens, binary fuse filters, bundle format, size limits
+- [SPEC](https://github.com/taggon/chaza/blob/main/SPEC.md) — full format and behavior specification
 
 ## Limitations
 
