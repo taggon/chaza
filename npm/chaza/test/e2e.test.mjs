@@ -43,9 +43,11 @@ describe("e2e: single-token search", () => {
     assert.equal(results[0].title, "대한민국 민법 제157조");
   });
 
-  test("올림픽 → 4 hits", () => {
+  test("올림픽 → multiple hits including 사격 doc", () => {
+    // >= 3, not an exact count: the exact tail can shift by one ~0.4%/doc
+    // false positive whenever filter bytes change.
     const results = chaza.search("올림픽");
-    assert.equal(results.length, 4);
+    assert.ok(results.length >= 3);
     assert.ok(results.some((r) => r.title.includes("사격")));
   });
 });
@@ -62,9 +64,10 @@ describe("e2e: multi-token OR ranking", () => {
 
   test("올림픽 사격 → both-token doc first", () => {
     const results = chaza.search("올림픽 사격");
-    assert.ok(results.length >= 4);
+    assert.ok(results.length >= 3);
     assert.ok(results[0].title.includes("올림픽"));
     assert.ok(results[0].title.includes("사격"));
+    assert.equal(results[0].hits, 2);
   });
 
   test("unknown token doesn't kill partial matches", () => {

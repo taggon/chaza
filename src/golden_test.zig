@@ -149,7 +149,9 @@ test "golden determinism: stopword added → different index bytes" {
 /// this constant catches unintended output drift BETWEEN commits
 /// (format, tokenization, prefix/choseong generation, filter construction).
 /// Update only for intentional pipeline/format changes.
-const GOLDEN_INDEX_XXH64: u64 = 0x3474f037bf512abf;
+// Updated 2026-07: binary_fuse populate fix (zero-init t2count/t2hash) removed a
+// garbage-driven wasted retry, changing filter seeds and therefore index bytes.
+const GOLDEN_INDEX_XXH64: u64 = 0x9876daeb051c8295;
 
 test "golden hash: index bytes match pinned xxhash64" {
     const allocator = std.testing.allocator;

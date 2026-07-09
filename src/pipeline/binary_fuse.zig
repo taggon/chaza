@@ -229,16 +229,20 @@ pub const BinaryFuse8 = struct {
         var rng_counter: u64 = 0x726b2b9d438b9d4d;
         self.seed = rngSplitmix64(&rng_counter);
 
+        // C reference callocs reverse_order/t2count/t2hash (read-before-write in the
+        // counting loop); alone/reverse_h are malloc'd there (write-before-read).
         const reverse_order = try a.alloc(u64, size + 1);
         defer a.free(reverse_order);
         const alone = try a.alloc(u32, capacity);
         defer a.free(alone);
         const t2count = try a.alloc(u8, capacity);
         defer a.free(t2count);
+        @memset(t2count, 0);
         const reverse_h = try a.alloc(u8, size);
         defer a.free(reverse_h);
         const t2hash = try a.alloc(u64, capacity);
         defer a.free(t2hash);
+        @memset(t2hash, 0);
 
         var block_bits: u5 = 1;
         while ((@as(u64, 1) << block_bits) < self.segment_count) {
@@ -470,6 +474,39 @@ pub const BinaryFuse8View = struct {
 };
 
 // ── Assertion tests ────────────────────────────────────────────────────
+
+test "populate: output independent of allocator memory contents (uninit t2count/t2hash regression)" {
+    // C reference callocs t2count/t2hash/reverse_order; a port that plain-allocs
+    // them reads garbage on the first iteration. Depending on the garbage this
+    // wasted a retry (different seed → different bytes), silently risked a wrong
+    // filter, or indexed h012 out of bounds and crashed in ReleaseFast.
+    // Building the same key set on top of 0x00-filled vs 0xFF-filled memory
+    // must yield byte-identical blobs.
+    var keys: [200]u64 = undefined;
+    for (&keys, 0..) |*k, i| k.* = @as(u64, i) *% 0x9E3779B97F4A7C15;
+
+    var blobs: [2][]u8 = undefined;
+    var bufs: [2][64 * 1024]u8 = undefined;
+    var storage: [2][blobSize(200)]u8 = undefined;
+
+    for (0..2) |round| {
+        @memset(&bufs[round], if (round == 0) 0x00 else 0xFF);
+        var fba = std.heap.FixedBufferAllocator.init(&bufs[round]);
+        const a = fba.allocator();
+
+        var keys_copy = keys;
+        var f = try BinaryFuse8.init(a, keys.len);
+        defer f.deinit();
+        try f.populate(&keys_copy);
+
+        f.writeBlob(storage[round][0..f.blobBytes()]);
+        blobs[round] = storage[round][0..f.blobBytes()];
+
+        for (keys) |k| try std.testing.expect(f.contains(k));
+    }
+
+    try std.testing.expectEqualSlices(u8, blobs[0], blobs[1]);
+}
 
 test "calculateSegmentLength: size=0 → 4" {
     try std.testing.expectEqual(@as(u32, 4), calculateSegmentLength(0));
