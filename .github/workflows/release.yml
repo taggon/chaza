@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build TypeScript loader
+        run: |
+          cd npm/chaza
+          npm ci || npm install
+          npm run build
+
+      - name: Build release binaries
+        run: bash scripts/build-release.sh
+
+      - name: Resolve version
+        id: ver
+        run: echo "tag=v$(node -p "require('./npm/chaza/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Zip all binaries
+        run: cd dist && zip -r "../chaza-${{ steps.ver.outputs.tag }}.zip" . && cd ..
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            dist/chaza-*
+            chaza-*.zip

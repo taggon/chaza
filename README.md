@@ -2,6 +2,8 @@
 
 A minimal static-site search engine — Zig + WASM. Finds Korean text even when you type only initial consonants (choseong).
 
+**[🔗 Live demo](https://taggon.github.io/chaza/)** — try `이석구`, `village`, or choseong like `ㅅㅈ`.
+
 - **Small.** The index stores binary fuse filters, not document text. ~0.5 MB for a few hundred pages.
 - **Korean choseong search.** Type ㄱㄴ and match 가나, 강남, 경남…
 - **All query work in WASM.** JavaScript only passes strings and renders results.

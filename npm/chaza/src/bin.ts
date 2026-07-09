@@ -3,7 +3,7 @@
  * chaza CLI entry point.
  *
  * Detects the platform and spawns the correct native binary from the
- * matching @chaza/{platform}-{arch} optional dependency package.
+ * matching @chaza-cli/{platform}-{arch} optional dependency package.
  */
 
 import { spawn } from "node:child_process";
@@ -15,14 +15,14 @@ const platform = process.platform;
 const arch = process.arch;
 const exe = platform === "win32" ? ".exe" : "";
 
-const pkgName = `@chaza/${platform}-${arch}`;
+const pkgName = `@chaza-cli/${platform}-${arch}`;
 
 let binaryPath: string | undefined;
 try {
   binaryPath = require.resolve(`${pkgName}/bin/chaza${exe}`);
 } catch {
   console.error(`chaza: missing optional dependency "${pkgName}"`);
-  console.error(`  Try: npm install @chaza/${platform}-${arch}`);
+  console.error(`  Try: npm install @chaza-cli/${platform}-${arch}`);
   process.exit(1);
 }
 
