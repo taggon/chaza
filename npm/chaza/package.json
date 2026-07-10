@@ -1,0 +1,40 @@
+{
+  "name": "chaza",
+  "version": "0.1.0",
+  "description": "A minimal static-site search engine — Zig + WASM",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/chaza.js",
+  "types": "dist/chaza.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taggon/chaza.git"
+  },
+  "bin": {
+    "chaza": "dist/bin.js"
+  },
+  "files": [
+    "dist/"
+  ],
+  "keywords": [
+    "WebAssembly",
+    "search",
+    "korean"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test test/e2e.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "@chaza-cli/darwin-arm64": "0.1.0",
+    "@chaza-cli/darwin-x64": "0.1.0",
+    "@chaza-cli/linux-arm64": "0.1.0",
+    "@chaza-cli/linux-x64": "0.1.0",
+    "@chaza-cli/win32-arm64": "0.1.0",
+    "@chaza-cli/win32-x64": "0.1.0"
+  }
+}

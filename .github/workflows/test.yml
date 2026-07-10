@@ -1,0 +1,48 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: xyzzylabs/setup-zig@v1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Build TypeScript loader
+        run: |
+          cd npm/chaza
+          npm ci || npm install
+          npm run build
+
+      - name: Run Zig tests
+        run: zig build test --summary all
+
+      - name: Build CLI
+        run: zig build
+
+      - name: Build test bundle
+        run: |
+          mkdir -p npm/chaza/test/fixtures
+          ./zig-out/bin/chaza build test/search_index.ko.json -o npm/chaza/test/fixtures/chaza.bundle --config test/chaza.json --no-js
+
+      - name: Run JS e2e tests
+        run: node --test npm/chaza/test/e2e.test.mjs
+
+      - name: Verify bundle
+        run: |
+          test -f npm/chaza/test/fixtures/chaza.bundle
+          SIZE=$(stat -c%s npm/chaza/test/fixtures/chaza.bundle)
+          echo "Bundle size: $SIZE bytes"
+          if [ "$SIZE" -lt 10000 ] || [ "$SIZE" -gt 100000 ]; then
+            echo "Unexpected bundle size"
+            exit 1
+          fi

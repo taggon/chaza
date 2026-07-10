@@ -1,0 +1,10 @@
+{
+  "schema": {
+    "indexed_fields": ["title", "body"],
+    "prefix_fields": [],
+    "url_field": "url"
+  },
+  "korean": {
+    "choseong_search": false
+  }
+}

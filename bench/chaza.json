@@ -1,0 +1,6 @@
+{
+  "schema": {
+    "indexed_fields": ["title", "body"],
+    "url_field": "url"
+  }
+}

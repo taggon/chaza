@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔎</text></svg>">
+  <title>Chaza — Live Demo</title>
+  <meta name="description" content="Chaza static-site search engine live demo. Korean choseong search powered by Zig + WASM.">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79b8ff;
+      --tag-bg: #21262d;
+      --tag-hover: #30363d;
+      --link: #58a6ff;
+      --link-underline: rgba(88, 166, 255, 0.4);
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #ffffff;
+        --panel: #f6f8fa;
+        --border: #d0d7de;
+        --text: #1f2328;
+        --muted: #656d76;
+        --accent: #0969da;
+        --accent-hover: #0550ae;
+        --tag-bg: #eaeef2;
+        --tag-hover: #d8dee4;
+        --link: #0969da;
+        --link-underline: rgba(9, 105, 218, 0.4);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 56px 20px 80px;
+    }
+    header { text-align: center; margin-bottom: 36px; }
+    h1 {
+      font-size: 2.4rem;
+      font-weight: 800;
+      margin: 0 0 6px;
+      letter-spacing: -0.02em;
+    }
+    h1 .dot { color: var(--accent); }
+    .subtitle {
+      color: var(--muted);
+      font-size: 1rem;
+      margin: 0;
+    }
+    .search-row { position: relative; margin-bottom: 14px; }
+    input[type="search"] {
+      width: 100%;
+      padding: 15px 18px 15px 46px;
+      font-size: 1.05rem;
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    input[type="search"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
+    }
+    input[type="search"]::placeholder { color: var(--muted); }
+    .search-icon {
+      position: absolute;
+      left: 15px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--muted);
+      pointer-events: none;
+    }
+    .examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 28px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 13px;
+      font-size: 0.85rem;
+      background: var(--tag-bg);
+      color: var(--muted);
+      border: 1px solid transparent;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+    .chip:hover { background: var(--tag-hover); color: var(--text); }
+    .chip .label { font-size: 0.72rem; opacity: 0.7; }
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.82rem;
+      color: var(--muted);
+      padding: 0 4px 10px;
+      min-height: 24px;
+    }
+    .timing { font-variant-numeric: tabular-nums; }
+    .timing b { color: var(--text); }
+    .results { list-style: none; margin: 0; padding: 0; }
+    .result {
+      padding: 16px 18px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 10px;
+      transition: border-color 0.15s;
+    }
+    .result:hover { border-color: var(--accent); }
+    .result a {
+      color: var(--link);
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 1.02rem;
+    }
+    .result a:hover { text-decoration: underline; text-decoration-color: var(--link-underline); }
+    .result-url {
+      display: block;
+      margin-top: 3px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .hits {
+      display: inline-block;
+      margin-left: 8px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: var(--accent);
+      background: rgba(88, 166, 255, 0.12);
+      padding: 1px 7px;
+      border-radius: 999px;
+      vertical-align: middle;
+    }
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 32px 0;
+      font-style: italic;
+    }
+    .loading {
+      text-align: center;
+      color: var(--muted);
+      padding: 48px 0;
+    }
+    .loading .dots::after {
+      content: "";
+      animation: dots 1.4s steps(4, end) infinite;
+    }
+    @keyframes dots {
+      0% { content: ""; } 25% { content: "."; }
+      50% { content: ".."; } 75% { content: "..."; }
+      100% { content: ""; }
+    }
+    .features {
+      display: flex;
+      gap: 24px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 48px;
+      padding-top: 28px;
+      border-top: 1px solid var(--border);
+      font-size: 0.83rem;
+      color: var(--muted);
+    }
+    .features span { white-space: nowrap; }
+    footer {
+      text-align: center;
+      margin-top: 28px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    footer a { color: var(--link); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+    @media (max-width: 520px) {
+      .wrap { padding: 36px 16px 60px; }
+      h1 { font-size: 1.9rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>chaza<span class="dot">.</span></h1>
+      <p class="subtitle">Static-site search · Zig + WASM · Korean choseong search</p>
+    </header>
+
+    <div class="search-row">
+      <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+      </svg>
+      <input type="search" id="q" placeholder="검색어를 입력하세요… (Try ㄱㄴ for choseong)" autocomplete="off" spellcheck="false" disabled>
+    </div>
+
+    <div class="examples" id="examples"></div>
+
+    <div class="status-bar">
+      <span id="status"></span>
+      <span class="timing" id="timing"></span>
+    </div>
+
+    <ul class="results" id="results">
+      <li class="loading" id="init-msg">인덱스 로딩중<span class="dots"></span></li>
+    </ul>
+
+    <div class="features">
+      <span>⚡ ~5µs / query</span>
+      <span>🔎 초성 검색 (ㅎㅂㅅ)</span>
+      <span>📦 48KB bundle</span>
+    </div>
+
+    <footer>
+      <a href="https://github.com/taggon/chaza">GitHub</a> · 100 Wikipedia docs (50 ko + 50 en)
+    </footer>
+  </div>
+
+  <script type="module">
+    import { Chaza } from "./chaza.js";
+
+    const EXAMPLES = [
+      { q: "이석구", label: "한국어" },
+      { q: "올림픽", label: "한국어" },
+      { q: "village", label: "English" },
+      { q: "massacre", label: "English" },
+      { q: "곤고구미", label: "한국어" },
+    ];
+
+    const input = document.getElementById("q");
+    const resultsEl = document.getElementById("results");
+    const statusEl = document.getElementById("status");
+    const timingEl = document.getElementById("timing");
+    const examplesEl = document.getElementById("examples");
+
+    let chaza;
+    let debounceId;
+
+    EXAMPLES.forEach(({ q, label }) => {
+      const btn = document.createElement("button");
+      btn.className = "chip";
+      btn.innerHTML = `${q}<span class="label">${label}</span>`;
+      btn.addEventListener("click", () => {
+        input.value = q;
+        runSearch();
+        input.focus();
+      });
+      examplesEl.appendChild(btn);
+    });
+
+    async function init() {
+      try {
+        chaza = await Chaza.load("./chaza.bundle");
+        input.disabled = false;
+        document.getElementById("init-msg").textContent = "검색어를 입력하거나 아래 예시를 눌러보세요.";
+        input.focus();
+      } catch (e) {
+        document.getElementById("init-msg").innerHTML =
+          `인덱스 로딩 실패: ${e.message}`;
+      }
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function runSearch() {
+      if (debounceId) clearTimeout(debounceId);
+      debounceId = setTimeout(doSearch, 60);
+    }
+
+    function doSearch() {
+      const query = input.value.trim();
+      if (!query) {
+        resultsEl.innerHTML = "";
+        statusEl.textContent = "";
+        timingEl.textContent = "";
+        return;
+      }
+      if (!chaza) return;
+
+      const t0 = performance.now();
+      const results = chaza.search(query, { maxResults: 20 });
+      const dt = performance.now() - t0;
+
+      timingEl.innerHTML = results.length
+        ? `<b>${dt.toFixed(2)}</b> ms`
+        : "";
+
+      if (results.length === 0) {
+        resultsEl.innerHTML = `<li class="empty">결과가 없습니다.</li>`;
+        statusEl.textContent = `"${query}" — 검색 결과 없음`;
+        return;
+      }
+
+      statusEl.textContent = `${results.length}개 결과`;
+      resultsEl.innerHTML = results
+        .map((r) => {
+          const url = escapeHtml(r.url);
+          const display = url.replace(/^https?:\/\//, "");
+          return `<li class="result">
+            <a href="${url}" target="_blank" rel="noopener">
+              ${escapeHtml(r.title)}
+              <span class="hits">${r.hits}</span>
+            </a>
+            <span class="result-url">${display}</span>
+          </li>`;
+        })
+        .join("");
+    }
+
+    input.addEventListener("input", runSearch);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        input.value = "";
+        doSearch();
+      }
+    });
+
+    init();
+  </script>
+</body>
+</html>
