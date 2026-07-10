@@ -3,9 +3,6 @@
 zig-out/
 dist/
 test-out/
-npm/@chaza-cli/
-npm/chaza/LICENSE
-npm/chaza/README.md
 node_modules/
 coverage/
 demo/chaza.bundle

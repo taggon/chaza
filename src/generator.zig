@@ -12,6 +12,8 @@ const bundle_mod = @import("bundle.zig");
 const tokenize = @import("pipeline/tokenize.zig");
 const stopwords = @import("pipeline/stopwords.zig");
 const prefix = @import("pipeline/prefix.zig");
+const choseong = @import("pipeline/choseong.zig");
+const format = @import("index/format.zig");
 const reader = @import("index/reader.zig");
 const StopwordSet = stopwords.StopwordSet;
 
@@ -103,6 +105,9 @@ pub fn generate(
                 }
                 break :blk false;
             };
+            // Title tokens get 0x03-marked duplicates as a ranking signal:
+            // title matches outrank body-only matches on equal hits.
+            const is_title_field = std.mem.eql(u8, field, "title");
 
             if (obj.get(field)) |v| {
                 if (v == .string) {
@@ -125,6 +130,26 @@ pub fn generate(
                                 if (!token_set.contains(p)) {
                                     try token_set.put(p, {});
                                     try token_list.append(a, p);
+                                }
+                            }
+                        }
+                        // Title-marked duplicates (0x03): the token itself plus its
+                        // choseong tokens, so title/choseong queries can rank
+                        // title matches above body-only matches.
+                        if (is_title_field) {
+                            var marked: std.ArrayList([]const u8) = .empty;
+                            try marked.append(a, try std.mem.concat(a, u8, &.{ &.{format.TITLE_MARKER}, tok }));
+                            if (options.choseong_max_len > 0) {
+                                var cho: std.ArrayList([]const u8) = .empty;
+                                try choseong.extractPrefixes(a, tok, options.choseong_max_len, &cho);
+                                for (cho.items) |c| {
+                                    try marked.append(a, try std.mem.concat(a, u8, &.{ &.{format.TITLE_MARKER}, c }));
+                                }
+                            }
+                            for (marked.items) |m| {
+                                if (!token_set.contains(m)) {
+                                    try token_set.put(m, {});
+                                    try token_list.append(a, m);
                                 }
                             }
                         }
@@ -427,6 +452,35 @@ test "prefix_fields default (title): title-word prefixes in filter, body-word pr
     // body word 'tutorial' indexed exactly but gets no prefix tokens
     try std.testing.expect(fuse.contains(hash.key64("tutorial")));
     try std.testing.expect(!fuse.contains(hash.key64("\x02tut")));
+}
+
+test "title tokens get 0x03-marked copies (incl. choseong); body tokens don't" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\[{"title":"Zig 안녕","url":"/z","body":"tutorial"}]
+    ;
+    const result = try generate(allocator, json, &.{}, .{
+        .indexed_fields = &.{ "title", "body" },
+    });
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    const idx = try reader.IndexView.open(view.index);
+
+    const binary_fuse = @import("pipeline/binary_fuse.zig");
+    const hash = @import("pipeline/hash.zig");
+    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
+
+    // title tokens: exact + 0x03 copy
+    try std.testing.expect(fuse.contains(hash.key64("zig")));
+    try std.testing.expect(fuse.contains(hash.key64("\x03zig")));
+    try std.testing.expect(fuse.contains(hash.key64("\x03안녕")));
+    // title choseong: 0x01 (writer) and 0x03+0x01 (generator title copy)
+    try std.testing.expect(fuse.contains(hash.key64("\x01\u{3147}")));
+    try std.testing.expect(fuse.contains(hash.key64("\x03\x01\u{3147}")));
+    // body token: exact only, no title copy
+    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
+    try std.testing.expect(!fuse.contains(hash.key64("\x03tutorial")));
 }
 
 test "prefix_fields=[] disables prefix tokens" {

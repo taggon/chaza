@@ -26,6 +26,11 @@ pub const CHOSEONG_MARKER: u8 = 0x01;
 /// Marker byte prepended to edge n-gram prefix tokens (prefix_fields).
 pub const PREFIX_MARKER: u8 = 0x02;
 
+/// Marker byte prepended to duplicate copies of title-field tokens (and their
+/// choseong tokens). Probed at query time as a secondary ranking signal:
+/// docs whose *title* matches outrank body-only matches on equal hits.
+pub const TITLE_MARKER: u8 = 0x03;
+
 pub const HEADER_SIZE: usize = @sizeOf(Header);
 pub const TAIL_META_SIZE: usize = @sizeOf(TailMeta);
 

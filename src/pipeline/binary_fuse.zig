@@ -709,3 +709,14 @@ test "sortAndRemoveDup: remove duplicates" {
     try std.testing.expectEqual(@as(u64, 3), keys[2]);
     try std.testing.expectEqual(@as(u64, 5), keys[3]);
 }
+
+test "BinaryFuse8: duplicate keys detected during populate" {
+    var keys = [_]u64{ 42, 42, 7, 7, 7, 100 };
+    var f = try BinaryFuse8.init(std.testing.allocator, keys.len);
+    defer f.deinit();
+    try f.populate(&keys);
+
+    try std.testing.expect(f.contains(42));
+    try std.testing.expect(f.contains(7));
+    try std.testing.expect(f.contains(100));
+}

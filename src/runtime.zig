@@ -1,8 +1,9 @@
 //! chaza runtime: WASM export API — in-memory search.
 //!
 //! For index bytes registered in global IndexView:
-//! query tokenization → each doc BinaryFuse8 filter OR lookup (hits = hit token count)
-//! → hits descending sort (tie: input order) → result encoding.
+//! query tokenization → each doc BinaryFuse8 filter OR lookup (hits = hit token count,
+//! title_hits = 0x03-probe hits) → sort by hits desc, title_hits desc, input order
+//! → result encoding.
 //! Results written to global buffer in [u32 count LE][(u32 doc_id, u32 hits) × count LE] format.
 
 const std = @import("std");
@@ -13,6 +14,7 @@ const hash = @import("pipeline/hash.zig");
 const tokenize = @import("pipeline/tokenize.zig");
 const choseong = @import("pipeline/choseong.zig");
 const prefix = @import("pipeline/prefix.zig");
+const format = @import("index/format.zig");
 
 // ── Global state ──
 
@@ -83,20 +85,34 @@ pub fn search(
         break :blk if (pt) |p| hash.key64(p) else null;
     };
 
+    // Precompute per-token keys once: exact + 0x03 title probe (ranking signal)
+    const keys = arena_alloc.alloc(TokenKeys, tokens.items.len) catch return writeEmptyResult();
+    for (tokens.items, 0..) |tok, i| {
+        const marked = arena_alloc.alloc(u8, tok.len + 1) catch return writeEmptyResult();
+        marked[0] = format.TITLE_MARKER;
+        @memcpy(marked[1..], tok);
+        keys[i] = .{ .exact = hash.key64(tok), .title = hash.key64(marked) };
+    }
+
     // Collect hit documents (OR: hits = hit token count, ≥1 is candidate)
     var candidates: std.ArrayList(ScoredDoc) = .empty;
     defer candidates.deinit(g_allocator);
 
     var doc_id: u32 = 0;
     while (doc_id < view.header.num_docs) : (doc_id += 1) {
-        const hits = countHitTokens(view, doc_id, tokens.items, last_prefix_key);
-        if (hits > 0) {
-            candidates.append(g_allocator, .{ .doc_id = doc_id, .hits = hits }) catch return writeEmptyResult();
+        const score = countHitTokens(view, doc_id, keys, last_prefix_key);
+        if (score.hits > 0) {
+            candidates.append(g_allocator, .{
+                .doc_id = doc_id,
+                .hits = score.hits,
+                .title_hits = score.title_hits,
+            }) catch return writeEmptyResult();
         }
     }
 
-    // Ranking: hits descending, tie → input order (doc_id ascending)
-    std.sort.pdq(ScoredDoc, candidates.items, {}, hitsDescThenDocIdAsc);
+    // Ranking: hits desc → title hits desc (title matches beat body-only
+    // matches and false positives) → input order (doc_id ascending)
+    std.sort.pdq(ScoredDoc, candidates.items, {}, rankLessThan);
 
     // Truncate
     const effective_max: usize = if (max_results == 0) 20 else @intCast(max_results);
@@ -115,39 +131,59 @@ pub fn search(
 
 // ── Internal functions ──
 
-/// Candidate document with its hit token count.
+/// Precomputed filter keys for one query token.
+const TokenKeys = struct {
+    exact: u64,
+    /// key of the 0x03-marked variant — hits when the token appears in the title
+    title: u64,
+};
+
+/// Per-document match score.
+const Score = struct {
+    hits: u32,
+    title_hits: u32,
+};
+
+/// Candidate document with its ranking keys.
 const ScoredDoc = struct {
     doc_id: u32,
     hits: u32,
+    title_hits: u32,
 };
 
-/// Ranking order: hits descending, tie → doc_id ascending (input order).
-fn hitsDescThenDocIdAsc(_: void, a: ScoredDoc, b: ScoredDoc) bool {
+/// Ranking order: hits desc → title_hits desc → doc_id asc (input order).
+fn rankLessThan(_: void, a: ScoredDoc, b: ScoredDoc) bool {
     if (a.hits != b.hits) return a.hits > b.hits;
+    if (a.title_hits != b.title_hits) return a.title_hits > b.title_hits;
     return a.doc_id < b.doc_id;
 }
 
-/// Count tokens hit in document's BinaryFuse8 filter (OR hits).
-/// The last token also matches via its prefix token (last_prefix_key) —
+/// Count tokens hit in document's BinaryFuse8 filter (OR hits), plus title
+/// hits (0x03 probe — ranking-only signal, not part of `hits`). The last
+/// token also matches via its prefix token (last_prefix_key) —
 /// exact-or-prefix counts as one hit.
 fn countHitTokens(
     view: reader.IndexView,
     doc_id: u32,
-    tokens: []const []const u8,
+    keys: []const TokenKeys,
     last_prefix_key: ?u64,
-) u32 {
-    const filter_bytes = view.docFilter(doc_id) orelse return 0;
-    if (filter_bytes.len == 0) return 0;
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return 0;
-    var hits: u32 = 0;
-    for (tokens, 0..) |tok, i| {
-        var hit = fuse.contains(hash.key64(tok));
-        if (!hit and i == tokens.len - 1) {
+) Score {
+    const none: Score = .{ .hits = 0, .title_hits = 0 };
+    const filter_bytes = view.docFilter(doc_id) orelse return none;
+    if (filter_bytes.len == 0) return none;
+    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return none;
+    var score = none;
+    for (keys, 0..) |k, i| {
+        var hit = fuse.contains(k.exact);
+        if (!hit and i == keys.len - 1) {
             if (last_prefix_key) |pk| hit = fuse.contains(pk);
         }
-        if (hit) hits += 1;
+        if (hit) {
+            score.hits += 1;
+            if (fuse.contains(k.title)) score.title_hits += 1;
+        }
     }
-    return hits;
+    return score;
 }
 
 /// Append u32 little-endian to result buffer.
@@ -476,6 +512,36 @@ test "Prefix probe applies to last token only" {
     try std.testing.expectEqual(@as(u32, 1), resultHits(r2, 0));
 }
 
+test "Title boost: title match outranks earlier body-only match on equal hits" {
+    const allocator = std.testing.allocator;
+    // doc 0: 'alpha' in body only. doc 1: 'alpha' in title (0x03-marked copy,
+    // as the generator emits). Equal hits → title_hits breaks the tie in
+    // favor of doc 1 despite its higher doc id.
+    const docs = [_]DocInput{
+        .{ .tokens = &.{ "alpha", "beta" }, .title = "Beta", .url = "/b", .meta_values = &.{""} },
+        .{ .tokens = &.{ "alpha", "gamma", "\x03alpha" }, .title = "Alpha", .url = "/a", .meta_values = &.{""} },
+    };
+    const input = IndexInput{
+        .meta_field_names = &.{"date"},
+        .docs = &docs,
+        .choseong_max_len = 3,
+    };
+    const bytes = try writer.write(allocator, input);
+    defer allocator.free(bytes);
+    set_index(bytes.ptr, bytes.len);
+    defer testCleanup();
+
+    const q = "alpha";
+    const result = search(q.ptr, q.len, 0);
+
+    try std.testing.expectEqual(@as(u32, 2), resultCount(result));
+    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 0)); // title match first
+    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 1));
+    // hits unchanged by the title probe — both docs matched 1 token
+    try std.testing.expectEqual(@as(u32, 1), resultHits(result, 0));
+    try std.testing.expectEqual(@as(u32, 1), resultHits(result, 1));
+}
+
 test "g_index not set → search → count=0" {
     g_index = null;
     defer testCleanup();
@@ -509,6 +575,45 @@ test "set_index: invalid magic → g_index=null, search → count=0" {
     const q = "test";
     const result = search(q.ptr, q.len, 0);
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
+}
+
+// ── alloc export tests ──
+
+test "alloc: returns writable, readable memory" {
+    const n: usize = 256;
+    const ptr = alloc(n);
+    const buf: []u8 = ptr[0..n];
+    defer g_allocator.free(buf);
+
+    for (buf, 0..) |*b, i| b.* = @intCast(i % 256);
+    try std.testing.expectEqual(@as(u8, 0), buf[0]);
+    try std.testing.expectEqual(@as(u8, 42), buf[42]);
+    try std.testing.expectEqual(@as(u8, 255), buf[255]);
+}
+
+test "alloc: multiple sizes succeed" {
+    const sizes = [_]usize{ 1, 64, 4096, 65536 };
+    for (sizes) |n| {
+        const ptr = alloc(n);
+        const buf: []u8 = ptr[0..n];
+        defer g_allocator.free(buf);
+        buf[n - 1] = 0xAA;
+        try std.testing.expectEqual(@as(u8, 0xAA), buf[n - 1]);
+    }
+}
+
+test "alloc: distinct allocations do not alias" {
+    const n: usize = 128;
+    const p1: []u8 = alloc(n)[0..n];
+    defer g_allocator.free(p1);
+    const p2: []u8 = alloc(n)[0..n];
+    defer g_allocator.free(p2);
+
+    try std.testing.expect(p1.ptr != p2.ptr);
+    for (p1) |*b| b.* = 0x11;
+    for (p2) |*b| b.* = 0x22;
+    try std.testing.expectEqual(@as(u8, 0x11), p1[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), p2[0]);
 }
 
 // ── wasm export forced (avoid lazy compilation) ──

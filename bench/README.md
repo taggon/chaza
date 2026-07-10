@@ -30,11 +30,15 @@ Outputs (written to `bench/out/`, git-ignored):
 - output sizes, raw and gzip -9
 - search latency — 2,000 mixed Korean/English queries per engine in Node, after 200-query warmup
 - a sanity check that both engines return the same document for the same query
+- accuracy — recall@20 / precision on 120 sampled real tokens, false-positive rate on 200 letters-only fake tokens, known-item MRR@10 (rarest title token per doc), and chaza-only choseong retrieval; ground truth comes from a neutral reference tokenizer scanning the corpus directly
+
+A snapshot of a full run with analysis lives in [RESULTS.md](RESULTS.md).
 
 Override binaries with `CHAZA_BIN` / `TINYSEARCH_BIN` env vars.
 
 ## Fairness notes
 
+- Both engines index title + body: tinysearch's schema is fixed, so chaza is passed `bench/chaza.json` to match (chaza's default would index title only).
 - tinysearch is timed with `--release` (its production mode); chaza with `ReleaseFast` (its release mode, same as shipped npm binaries).
 - Search latency measures each engine through its own official JS wrapper (`chaza.js` loader / `tinysearch_engine.js` glue), which is what a site would actually run.
 - tinysearch has no Korean choseong support and no ranking; result-quality differences are out of scope here — this measures speed and size only.

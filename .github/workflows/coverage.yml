@@ -1,0 +1,41 @@
+name: Coverage
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install kcov dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-dev build-essential cmake libssl-dev libcurl4-openssl-dev libelf-dev libstdc++-12-dev zlib1g-dev libdw-dev libiberty-dev
+
+      - name: Build and install kcov
+        run: |
+          git clone https://github.com/SimonKagstrom/kcov.git
+          mkdir -p kcov/build
+          cd kcov/build
+          cmake ..
+          make
+          make install
+
+      - name: Run tests with coverage
+        run: zig build coverage
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: ./zig-out/coverage
+          fail_ci_if_error: true

@@ -11,6 +11,8 @@
 - **쿼리 토큰 상한 16.** 17번째 이후 토큰 무시 → hits 범위 0~16. OR 오탐 누적(토큰당 문서 ~0.4%)과 조회 비용 상한.
 - **Bloom 폴백·`--fp-rate` 미구현 확정.** fuse가 Bloom을 크기·속도·오탐 모두 흡수 — 폴백 유지 이유 없음. `filter_kind`는 미래 확장용 포맷 예약으로만 잔존 (format.zig 주석 참조). 본문의 `bloom.zig`·`--fp-rate` 서술은 v1.2 계획 당시 기준.
 - **prefix 검색 (search-as-you-type).** `prefix_fields`(기본 `["title"]`, `indexed_fields` 부분집합 강제) 단어에 edge n-gram prefix 토큰(2~8 코드포인트, 마커 `\x02`, 진부분 prefix만) 색인 — `pipeline/prefix.zig`. 쿼리 마지막 토큰만 exact + prefix 병행 조회. body 제외라 비용 문서당 수십 바이트. 포맷 변경 없음.
+- **기본 불용어 내장.** 리포 루트 `stopwords.txt`를 `@embedFile`로 CLI에 임베드 — `--stopwords` 미지정 시 적용, 지정 시 대체, 빈 파일이면 비활성. 안전 기준: 단독 검색어 가능성 있는 단어(it/us/may/will) 배제. 본문의 "기본 리스트 없음" 서술은 v1.2 기준.
+- **title 매치 랭킹.** title 토큰(+초성)의 `\x03` 사본을 색인, 쿼리 시 `\x03` 프로브로 title_hits 집계 → 정렬 2차 키 (hits ↓ → title_hits ↓ → 입력 순). 오탐/본문 매치가 제목 매치 위에 오던 known-item MRR 문제 해소 (0.38→0.98 @1,000문서). 크기 +2%, API 불변.
 - 아래 본문의 "AND 고정"·`sort_field_idx`·반환 포맷 관련 서술은 v1.2 당시 기준 — SPEC.md v1.3이 우선.
 
 ## v1.2에서 바뀐 점 (v1.1 대비)

@@ -34,6 +34,8 @@ Input is assumed UTF-8 + NFC. NFD (decomposed) Hangul breaks choseong extraction
 
 ### Stopwords
 
+A built-in default list (English function words + standalone Korean fillers, curated to never contain a plausible standalone search term) is embedded in the CLI and applied automatically. `--stopwords <file>` replaces it; an empty file disables removal.
+
 Stopwords are removed **at index time only**. The list is not shipped in the bundle, so the runtime cannot filter them from queries — a stopword never matches any document. If only some query tokens are stopwords, the remaining tokens still match (OR ranking); if every token is a stopword, the result is empty.
 
 ### Choseong tokens (`\x01`)
@@ -45,6 +47,10 @@ For each Hangul word, the initial consonants of its first 1–`choseong_max_len`
 Words in `prefix_fields` (default: `title`) additionally index their first 2–8 codepoints as `\x02`-tagged tokens: "programming" → `\x02pr` … `\x02programm`. At query time only the **last** token — the word being typed — is probed both exactly and as `\x02`-prefixed; either hit counts as one match. This gives search-as-you-type on titles for a few dozen bytes per document, while body words stay exact-match.
 
 Prefix lookups are impossible at the filter level (see below) — materializing prefixes as tokens at index time is the only route, and it is the same trick choseong uses.
+
+### Title-ranking tokens (`\x03`)
+
+Tokens from the title field (and their choseong tokens) are indexed a second time with a `\x03` marker. At query time every token is also probed as `\x03`-marked; the count (`title_hits`) is a **ranking-only** signal — it never changes `hits` or the JS API. On equal `hits`, documents whose *title* matches outrank body-only matches and false positives (a false positive would have to pass two independent probes, ~0.4%² ≈ 0.002%). This lifted known-item MRR@10 from 0.38 to 0.98 on a 1,000-document corpus for ~2% extra bundle size.
 
 ## Filter: BinaryFuse8
 
@@ -73,8 +79,8 @@ The filter is the only representation stored — no original text or token list 
 1. Tokenize the query with the same pipeline as indexing
 2. Mark choseong-only tokens with `\x01`; build the `\x02` prefix probe for the last token
 3. Cap at 16 query tokens (see below)
-4. For every document, count how many query tokens hit its filter (`hits`)
-5. Keep documents with `hits ≥ 1`, sort by `hits` descending (ties: document input order)
+4. For every document, count how many query tokens hit its filter (`hits`) and how many hit as `\x03` title probes (`title_hits`)
+5. Keep documents with `hits ≥ 1`, sort by `hits` desc, then `title_hits` desc, then document input order
 6. Truncate to `max_results` (0 → 20)
 7. Return a buffer: `[u32 count][(u32 doc_id, u32 hits) × count]`, little-endian
 

@@ -11,19 +11,20 @@
 
 ## vs tinysearch
 
-Chaza는 [tinysearch](https://github.com/tinysearch/tinysearch)에서 영감을 받았고 같은 코퍼스 포맷을 읽습니다. 동일한 위키백과 100문서 코퍼스(한국어 50 + 영어 50), Apple M1 Max, Node v22 기준 — [`bench/`](bench/)에서 재현 가능:
+Chaza는 [tinysearch](https://github.com/tinysearch/tinysearch)에서 영감을 받았고 같은 코퍼스 포맷을 읽습니다. 동일한 위키백과 100문서 코퍼스(한국어+영어), 양쪽 모두 title+body 색인, Apple M1 Max, Node v22 기준:
 
 | | chaza | tinysearch 0.10 | |
 |---|---|---|---|
-| 인덱스 빌드 시간 | **4.7 ms** | 4.6 s¹ | 약 1,000배 빠름 |
-| 검색 속도 (Node, 2,000 쿼리) | **4.6 µs/쿼리** | 316 µs/쿼리 | 약 70배 빠름 |
-| 산출물 크기 (raw) | 38 KB 번들 + 12 KB 로더 | 142 KB wasm + 2 KB 글루 | 약 3배 작음 |
-| 산출물 크기 (gzip) | **14 KB** + 4 KB 로더 | 68 KB + 1 KB 글루 | 약 4배 작음 |
-| 한국어 초성 검색 | ✅ | ❌ | |
-| 단일 바이너리로 완결 | ✅ | ❌ Rust + wasm 툴체인 필요² | |
+| 인덱스 빌드 시간 | **7.8 ms** | 4.6 s | 약 600배 빠름 |
+| 검색 속도 | **5.2 µs/쿼리** | 313 µs/쿼리 | 약 60배 빠름 |
+| 산출물 크기 (gzip) | **25 KB** | 69 KB | 약 3배 작음 |
+| Recall@20 | **96.7%** | 87.5% | |
+| Known-item MRR@10 | **0.99** | 0.98 | |
+| 오탐률 | 0.39%/doc | 0.27%/doc | |
+| 한국어 초성 검색 | ✅ (100% 검색 성공) | ❌ | |
+| 단일 바이너리로 완결 | ✅ | ❌ Rust + wasm 툴체인 필요 | |
 
-¹ cargo 캐시가 적용된 상태 기준 — tinysearch는 인덱스를 만들 때마다 Rust 크레이트를 생성·컴파일. 최초 빌드는 의존성 컴파일까지 포함해 수 분.
-² 인덱스 빌드 시점에 `rustc`, `wasm32-unknown-unknown` 타겟, `binaryen` 필요. chaza는 미리 빌드한 런타임을 CLI 바이너리에 내장.
+전체 결과(500/1,000문서 스케일링, 정확도 측정 방법, 한계까지 포함): [`bench/RESULTS.md`](bench/RESULTS.md). 재현은 [`bench/`](bench/) 참고.
 
 ## 설치
 
@@ -77,7 +78,8 @@ chaza build <corpus.json> [옵션]
 옵션:
   -o, --output <path>      출력 번들 경로 (기본: chaza.bundle)
   --config <path>          chaza.json 설정 파일 경로
-  --stopwords <path>       불용어 파일 (줄 단위)
+  --stopwords <path>       불용어 파일 (내장 기본 리스트 대체,
+                           빈 파일이면 제거 비활성)
   --no-choseong            초성 검색 비활성화
   --no-js                  chaza.js 로더 출력 생략
   -q, --quiet              진행 로그 숨김
@@ -133,7 +135,7 @@ chaza build <corpus.json> [옵션]
 
 ## 검색 동작
 
-- **다중 토큰은 OR + 매칭 수 랭킹** — 매칭 토큰이 많은 문서가 먼저 오고, 그 수가 각 결과의 `hits`로 제공됩니다.
+- **다중 토큰은 OR + 매칭 수 랭킹** — 매칭 토큰이 많은 문서가 먼저 오고, 그 수가 각 결과의 `hits`로 제공됩니다. `hits` 동점이면 **제목이 매칭된 문서**가 본문-전용 매치보다 위에 옵니다.
 - **마지막 검색어는 prefix(2~8자)로도 매칭** — `프로그`로 제목에 "프로그래밍"이 있는 문서를 찾음 (`prefix_fields` 대상).
 - **초성 쿼리** `ㅅㅈ`는 해당 초성으로 시작하는 단어가 있는 문서에 매칭.
 - **`max_results`** 기본 20: `chaza.search("hello", { maxResults: 10 })`. 결과는 `hits` 순 — 날짜순 등 다른 기준은 반환된 배열을 JS에서 정렬.

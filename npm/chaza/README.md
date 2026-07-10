@@ -131,7 +131,8 @@ chaza build <corpus.json> [options]
 Options:
   -o, --output <path>      Output bundle path (default: chaza.bundle)
   --config <path>          Path to chaza.json config file
-  --stopwords <path>       Stopwords file (line-separated)
+  --stopwords <path>       Stopwords file (replaces built-in default;
+                           empty file disables removal)
   --no-choseong            Disable choseong search
   --no-js                  Skip writing chaza.js loader
   -q, --quiet              Suppress progress output

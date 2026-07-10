@@ -43,9 +43,11 @@ pub fn build(b: *std.Build) void {
     _ = embed_files.add("embeds.zig",
         \\pub const runtime_wasm: []const u8 = @embedFile("runtime.wasm");
         \\pub const loader_js: []const u8 = @embedFile("chaza.js");
+        \\pub const default_stopwords: []const u8 = @embedFile("stopwords.txt");
     );
     _ = embed_files.addCopyFile(runtime_exe.getEmittedBin(), "runtime.wasm");
     _ = embed_files.addCopyFile(b.path("npm/chaza/dist/chaza.js"), "chaza.js");
+    _ = embed_files.addCopyFile(b.path("stopwords.txt"), "stopwords.txt");
 
     const embeds_mod = b.createModule(.{
         .root_source_file = embed_files.getDirectory().path(b, "embeds.zig"),
@@ -89,4 +91,20 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // -- coverage step --
+    const coverage_step = b.step("coverage", "Generate test coverage report");
+
+    const kcov = b.addSystemCommand(&.{
+        "kcov",
+        "--include-pattern=/src/",
+    });
+    const cov_out = kcov.addOutputDirectoryArg("coverage");
+    kcov.addArtifactArg(mod_tests);
+
+    coverage_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = cov_out,
+        .install_dir = .prefix,
+        .install_subdir = "coverage",
+    }).step);
 }

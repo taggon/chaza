@@ -11,19 +11,20 @@ A minimal static-site search engine — Zig + WASM. Finds Korean text even when 
 
 ## vs tinysearch
 
-Chaza is inspired by [tinysearch](https://github.com/tinysearch/tinysearch) and reads the same corpus format. Same 100-document Wikipedia corpus (50 Korean + 50 English), Apple M1 Max, Node v22 — reproduce with [`bench/`](bench/):
+Chaza is inspired by [tinysearch](https://github.com/tinysearch/tinysearch) and reads the same corpus format. Same 100-document Wikipedia corpus (Korean + English), both indexing title + body, Apple M1 Max, Node v22:
 
 | | chaza | tinysearch 0.10 | |
 |---|---|---|---|
-| Index build time | **4.7 ms** | 4.6 s¹ | ~1,000× faster |
-| Search latency (Node, 2,000 queries) | **4.6 µs/query** | 316 µs/query | ~70× faster |
-| Output size (raw) | 38 KB bundle + 12 KB loader | 142 KB wasm + 2 KB glue | ~3× smaller |
-| Output size (gzip) | **14 KB** + 4 KB loader | 68 KB + 1 KB glue | ~4× smaller |
-| Korean choseong search | ✅ | ❌ | |
-| Single binary, no toolchain | ✅ | ❌ needs Rust + wasm toolchain² | |
+| Index build time | **7.8 ms** | 4.6 s | ~600× faster |
+| Search latency | **5.2 µs/query** | 313 µs/query | ~60× faster |
+| Output size (gzip) | **25 KB** | 69 KB | ~3× smaller |
+| Recall@20 | **96.7%** | 87.5% | |
+| Known-item MRR@10 | **0.99** | 0.98 | |
+| False positives | 0.39%/doc | 0.27%/doc | |
+| Korean choseong search | ✅ (100% retrieval) | ❌ | |
+| Single binary, no toolchain | ✅ | ❌ needs Rust + wasm toolchain | |
 
-¹ With a warm cargo cache — tinysearch generates and compiles a Rust crate on every index build. The first-ever build also compiles dependencies (minutes).
-² `rustc`, `wasm32-unknown-unknown` target, and `binaryen` at index-build time. Chaza ships the pre-built runtime inside the CLI binary.
+Full results (500/1,000-doc scaling, accuracy methodology, honest caveats): [`bench/RESULTS.md`](bench/RESULTS.md). Reproduce with [`bench/`](bench/).
 
 ## Install
 
@@ -77,7 +78,8 @@ chaza build <corpus.json> [options]
 Options:
   -o, --output <path>      Output bundle path (default: chaza.bundle)
   --config <path>          Path to chaza.json config file
-  --stopwords <path>       Stopwords file (line-separated)
+  --stopwords <path>       Stopwords file (replaces built-in default;
+                           empty file disables removal)
   --no-choseong            Disable choseong search
   --no-js                  Skip writing chaza.js loader
   -q, --quiet              Suppress progress output
@@ -133,7 +135,7 @@ Numbers are stringified automatically.
 
 ## Search behavior
 
-- **Multi-token queries are OR with hit-count ranking** — documents matching more tokens come first; each result carries the count as `hits`.
+- **Multi-token queries are OR with hit-count ranking** — documents matching more tokens come first; each result carries the count as `hits`. On equal `hits`, documents whose **title** matches rank above body-only matches.
 - **The last query token also matches by prefix** (2–8 chars) against `prefix_fields` words — `progr` finds a title containing "Programming".
 - **Choseong queries** like `ㅅㅈ` match documents with a word starting with those initial consonants.
 - **`max_results`** defaults to 20: `chaza.search("hello", { maxResults: 10 })`. Results are ordered by `hits`; for other orders (date, etc.), sort the returned array in JavaScript.

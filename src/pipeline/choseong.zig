@@ -89,11 +89,12 @@ pub fn addChoseongTokens(
     // Extract choseong prefix from each original token and add
     var i: usize = 0;
     while (i < original_len) : (i += 1) {
-        // Marker-tagged tokens (choseong 0x01 / prefix 0x02) skipped — their
-        // Hangul syllables are a prefix of some full word's, so any choseong
-        // tokens they would yield are already produced by that word.
+        // Marker-tagged tokens (choseong 0x01 / prefix 0x02 / title 0x03)
+        // skipped — their Hangul syllables are a prefix of some full word's,
+        // so any choseong tokens they would yield are already produced by
+        // that word (title copies get their own marked choseong in the generator).
         const first = tokens.items[i];
-        if (first.len > 0 and (first[0] == format.CHOSEONG_MARKER or first[0] == format.PREFIX_MARKER)) continue;
+        if (first.len > 0 and first[0] <= format.TITLE_MARKER) continue;
 
         var prefixes: std.ArrayList([]const u8) = .empty;
         defer {

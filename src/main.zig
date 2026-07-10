@@ -10,9 +10,10 @@ const chaza = @import("chaza");
 const generator = chaza.generator;
 const embeds = @import("chaza_embeds");
 
-// build.zig injects runtime.wasm and chaza.js via @embedFile.
+// build.zig injects runtime.wasm, chaza.js, and stopwords.txt via @embedFile.
 const RUNTIME_WASM: []const u8 = embeds.runtime_wasm;
 const LOADER_JS: []const u8 = embeds.loader_js;
+const DEFAULT_STOPWORDS: []const u8 = embeds.default_stopwords;
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -101,20 +102,24 @@ pub fn main(init: std.process.Init) !void {
     // CLI override
     if (no_choseong) options.choseong_max_len = 0;
 
-    // Load stopwords file
-    var sw_count: ?usize = null;
-    if (stopwords_path) |sp| {
-        const sw_bytes = cwd.readFileAlloc(io, sp, arena, .limited(10 * 1024 * 1024)) catch |err| {
-            std.debug.print("chaza: cannot read stopwords '{s}': {}\n", .{ sp, err });
-            return err;
-        };
-        const sw = chaza.pipeline.stopwords.StopwordSet.fromFileBytes(arena, sw_bytes) catch |err| {
-            std.debug.print("chaza: cannot parse stopwords '{s}': {}\n", .{ sp, err });
-            return err;
-        };
-        sw_count = sw.count();
-        options.stopwords = sw;
-    }
+    // Stopwords: --stopwords file replaces the embedded default (an empty file disables removal)
+    var sw_source: []const u8 = "default";
+    const sw_bytes = blk: {
+        if (stopwords_path) |sp| {
+            sw_source = sp;
+            break :blk cwd.readFileAlloc(io, sp, arena, .limited(10 * 1024 * 1024)) catch |err| {
+                std.debug.print("chaza: cannot read stopwords '{s}': {}\n", .{ sp, err });
+                return err;
+            };
+        }
+        break :blk DEFAULT_STOPWORDS;
+    };
+    const sw = chaza.pipeline.stopwords.StopwordSet.fromFileBytes(arena, sw_bytes) catch |err| {
+        std.debug.print("chaza: cannot parse stopwords ({s}): {}\n", .{ sw_source, err });
+        return err;
+    };
+    const sw_count = sw.count();
+    options.stopwords = sw;
 
     // Generate
     const result = generator.generate(arena, corpus_bytes, RUNTIME_WASM, options) catch |err| {
@@ -146,9 +151,7 @@ pub fn main(init: std.process.Init) !void {
     if (!quiet) {
         const choseong_status = if (options.choseong_max_len > 0) "on" else "off";
         std.debug.print("parsed {d} documents\n", .{result.num_docs});
-        if (sw_count) |c| {
-            std.debug.print("stopwords: {d} entries\n", .{c});
-        }
+        std.debug.print("stopwords: {d} entries ({s})\n", .{ sw_count, sw_source });
         std.debug.print("tokenized (choseong: {s}, max_len {d})\n", .{ choseong_status, options.choseong_max_len });
         std.debug.print("wrote index: ~{d} bytes\n", .{result.index_size});
         std.debug.print("embedded runtime wasm: {d} bytes\n", .{RUNTIME_WASM.len});
@@ -216,7 +219,8 @@ fn printUsage() void {
         \\Options:
         \\  -o, --output <path>      Output bundle path (default: chaza.bundle)
         \\  --config <path>          Path to chaza.json config file
-        \\  --stopwords <path>       Stopwords file (line-separated)
+        \\  --stopwords <path>       Stopwords file (line-separated; replaces built-in default,
+        \\                           pass an empty file to disable removal)
         \\  --no-choseong            Disable choseong search
         \\  --no-js                  Skip writing chaza.js loader
         \\  -q, --quiet              Suppress progress output
