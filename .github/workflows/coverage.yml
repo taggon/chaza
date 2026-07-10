@@ -1,0 +1,54 @@
+name: Coverage
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: xyzzylabs/setup-zig@v1
+
+      - name: Install kcov dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-dev build-essential cmake libssl-dev libcurl4-openssl-dev libelf-dev libstdc++-12-dev zlib1g-dev libdw-dev libiberty-dev
+
+      - name: Build and install kcov
+        run: |
+          git clone https://github.com/SimonKagstrom/kcov.git
+          mkdir -p kcov/build
+          cd kcov/build
+          cmake ..
+          make -j$(nproc)
+          sudo make install
+
+      - name: Run tests with coverage
+        id: kcov
+        run: |
+          zig build coverage
+          path=$(find zig-out/coverage -name cov.xml | head -n1)
+          if [ -z "$path" ]; then
+            echo "cov.xml not found under zig-out/coverage"
+            find zig-out/coverage -type f
+            exit 1
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect coverage xml
+        run: |
+          echo "=== sources ==="
+          grep -A3 "<sources>" "${{ steps.kcov.outputs.path }}"
+          echo "=== first few filenames ==="
+          grep "filename=" "${{ steps.kcov.outputs.path }}" | head -n 10
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v6
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ${{ steps.kcov.outputs.path }}
+          fail_ci_if_error: true

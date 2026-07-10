@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: xyzzylabs/setup-zig@v1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Build TypeScript loader
+        run: |
+          cd npm/chaza
+          npm ci || npm install
+          npm run build
+
+      - name: Build release binaries
+        run: bash scripts/build-release.sh
+
+      - name: Resolve version
+        id: ver
+        run: echo "tag=v$(node -p "require('./npm/chaza/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Zip each binary
+        run: |
+          cd dist
+          for f in chaza-*; do
+            [ -f "$f" ] || continue
+            zip -q "${f}.zip" "$f"
+            rm "$f"
+          done
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            dist/*.zip

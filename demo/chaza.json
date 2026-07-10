@@ -1,0 +1,13 @@
+{
+  "schema": {
+    "indexed_fields": [
+      "title",
+      "body"
+    ],
+    "url_field": "url"
+  },
+  "korean": {
+    "choseong_search": true,
+    "choseong_max_len": 3
+  }
+}

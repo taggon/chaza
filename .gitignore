@@ -1,0 +1,9 @@
+.DS_Store
+.zig-cache/
+zig-out/
+dist/
+test-out/
+node_modules/
+coverage/
+demo/chaza.bundle
+demo/chaza.js
