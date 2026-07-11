@@ -1,12 +1,14 @@
 # Chaza
 
-[![https://img.shields.io/npm/v/chaza]](https://npmjs.com/package/chaza) [![codecov](https://codecov.io/github/taggon/chaza/graph/badge.svg?token=SQDPKO0S4S)](https://codecov.io/github/taggon/chaza) ![Test](https://github.com/taggon/chaza/workflows/Test/badge.svg)
+![NPM Version](https://img.shields.io/npm/v/chaza-cli) [![codecov](https://codecov.io/github/taggon/chaza/graph/badge.svg?token=SQDPKO0S4S)](https://codecov.io/github/taggon/chaza) ![Test](https://github.com/taggon/chaza/workflows/Test/badge.svg) ![GitHub License](https://img.shields.io/github/license/taggon/chaza)
 
 초성으로도 찾아주는 아주 작은 정적 사이트 검색 엔진 — Zig + WASM.
 
-**[🔗 라이브 데모](https://taggon.github.io/chaza/)** — `이석구`, `village` 또는 `ㅅㅈ` 같은 초성 검색을 직접 체험해보세요.
+[라이브 데모](https://taggon.github.io/chaza/) | [[English]](https://github.com/taggon/chaza/blob/main/README.md)
 
-- **가볍다.** 인덱스는 문서 본문이 아닌 binary fuse filter만 저장. 문서 수백 페이지 기준 ~0.5 MB.
+## 특징
+
+- **가벼움.** 인덱스는 문서 본문이 아닌 binary fuse filter만 저장. 문서 수백 페이지 기준 ~0.5 MB.
 - **한국어 초성 검색.** ㄱㄴ만 입력해도 가나, 강남, 경남… 매칭.
 - **쿼리 처리 전부 WASM.** JS는 문자열 전달과 결과 렌더링만.
 - **최종 사용자에게 컴파일러 불필요.** 런타임 WASM이 CLI 바이너리에 포함. 인덱스 생성은 바이트 이어붙이기만.
@@ -26,14 +28,14 @@ Chaza는 [tinysearch](https://github.com/tinysearch/tinysearch)에서 영감을 
 | 한국어 초성 검색 | ✅ (100% 검색 성공) | ❌ | |
 | 단일 바이너리로 완결 | ✅ | ❌ Rust + wasm 툴체인 필요 | |
 
-전체 결과(500/1,000문서 스케일링, 정확도 측정 방법, 한계까지 포함): [`bench/RESULTS.md`](bench/RESULTS.md). 재현은 [`bench/`](bench/) 참고.
+전체 결과(500/1,000문서 스케일링, 정확도 측정 방법, 한계까지 포함): [`bench/RESULTS.md`](bench/RESULTS.md). 재현 방법은 [`bench/`](bench/) 참고.
 
 ## 설치
 
 **npm:**
 
 ```bash
-npm install chaza
+npm install chaza-cli
 ```
 
 **셸 (단독 바이너리):**
@@ -64,7 +66,7 @@ npx chaza build corpus.json -o chaza.bundle --config chaza.json
 
 ```html
 <script type="module">
-  import { Chaza } from "chaza";
+  import { Chaza } from "chaza-cli";
   const chaza = await Chaza.load("./chaza.bundle");
   const results = chaza.search("ㄱㄴ");
 </script>
@@ -145,7 +147,7 @@ chaza build <corpus.json> [옵션]
 ## 제약사항
 
 - **입력은 UTF-8 + NFC 전제.** NFD(조합형) 한글은 초성 추출이 깨짐.
-- **오탐 존재.** 조회의 ~0.4%가 토큰이 없는 문서에 매칭될 수 있음 — 필터의 태생적 특성. 실용적 코퍼스 상한은 수천 문서.
+- **오탐 존재.** 조회의 ~0.4%가 토큰이 없는 문서에 매칭될 수 있음. 필터의 태생적 특성. 실용적 코퍼스 상한은 수천 문서.
 - **정적 인덱스.** 증분 업데이트 불가. 문서 추가/삭제 시 재생성.
 - **불용어는 검색 불가.** 불용어만으로 이루어진 쿼리는 결과 없음.
 
@@ -153,10 +155,6 @@ chaza build <corpus.json> [옵션]
 
 - [작동 원리](docs/how-it-works.ko.md) — 토큰화 파이프라인, 초성/prefix 토큰, binary fuse filter, 번들 포맷, 규모 한계
 - [SPEC.md](SPEC.md) — 포맷·동작 전체 명세
-
-## 감사
-
-[tinysearch](https://github.com/tinysearch/tinysearch)에서 영감을 받았습니다.
 
 ## 라이선스
 

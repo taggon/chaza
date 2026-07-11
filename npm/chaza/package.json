@@ -1,5 +1,5 @@
 {
-  "name": "chaza",
+  "name": "chaza-cli",
   "version": "0.1.0",
   "description": "A minimal static-site search engine — Zig + WASM",
   "license": "MIT",

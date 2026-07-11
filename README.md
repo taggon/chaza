@@ -1,10 +1,12 @@
 # Chaza
 
-[![https://img.shields.io/npm/v/chaza]](https://npmjs.com/package/chaza) [![codecov](https://codecov.io/github/taggon/chaza/graph/badge.svg?token=SQDPKO0S4S)](https://codecov.io/github/taggon/chaza) ![Test](https://github.com/taggon/chaza/workflows/Test/badge.svg)
+![NPM Version](https://img.shields.io/npm/v/chaza-cli) [![codecov](https://codecov.io/github/taggon/chaza/graph/badge.svg?token=SQDPKO0S4S)](https://codecov.io/github/taggon/chaza) ![Test](https://github.com/taggon/chaza/workflows/Test/badge.svg) ![GitHub License](https://img.shields.io/github/license/taggon/chaza)
 
 A minimal static-site search engine — Zig + WASM. Finds Korean text even when you type only initial consonants (choseong).
 
-**[🔗 Live demo](https://taggon.github.io/chaza/)** — try `이석구`, `village`, or choseong like `ㅅㅈ`.
+[Live demo](https://taggon.github.io/chaza/) | [[한국어]](https://github.com/taggon/chaza/blob/main/README.ko.md)
+
+## Features
 
 - **Small.** The index stores binary fuse filters, not document text. ~0.5 MB for a few hundred pages.
 - **Korean choseong search.** Type ㄱㄴ and match 가나, 강남, 경남…
@@ -33,7 +35,7 @@ Full results (500/1,000-doc scaling, accuracy methodology, honest caveats): [`be
 **npm:**
 
 ```bash
-npm install chaza
+npm install chaza-cli
 ```
 
 **Shell (standalone binary):**
@@ -64,7 +66,7 @@ Add `--no-js` to skip writing the loader.
 
 ```html
 <script type="module">
-  import { Chaza } from "chaza";
+  import { Chaza } from "chaza-cli";
   const chaza = await Chaza.load("./chaza.bundle");
   const results = chaza.search("ㄱㄴ");
 </script>
@@ -153,10 +155,6 @@ Numbers are stringified automatically.
 
 - [How it works](docs/how-it-works.md) — tokenization pipeline, choseong/prefix tokens, binary fuse filters, bundle format, size limits
 - [SPEC.md](SPEC.md) — full format and behavior specification
-
-## Acknowledgements
-
-Inspired by [tinysearch](https://github.com/tinysearch/tinysearch).
 
 ## License
 
