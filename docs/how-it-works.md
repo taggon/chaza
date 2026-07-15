@@ -26,7 +26,7 @@ Shared by the indexer (native) and the runtime (wasm) as the same Zig code — b
 2. Segment by script group (Latin, Hangul, Han, Hiragana, Katakana, Number). A run of the same group is one token; a group switch is a token boundary. Combining marks attach to the preceding run.
 3. Remove stopwords (`--stopwords` file, if given)
 4. Deduplicate per document
-5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 1–`choseong_max_len`
+5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 2–`choseong_max_len` for body words; title words keep length 1–`choseong_max_len`
 6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints (proper prefixes only)
 7. Deduplicate again
 
@@ -40,7 +40,7 @@ Stopwords are removed **at index time only**. The list is not shipped in the bun
 
 ### Choseong tokens (`\x01`)
 
-For each Hangul word, the initial consonants of its first 1–`choseong_max_len` syllables become extra tokens, tagged with a `\x01` marker byte: 안녕하세요 → `\x01ㅇ`, `\x01ㅇㄴ`, `\x01ㅇㄴㅎ`. At query time, a token consisting entirely of choseong jamo gets the same marker, so `ㅇㄴ` matches any document with a word whose initials start ㅇㄴ. No special-casing in the search path — marker tokens are looked up like any other token.
+For each Hangul word, the initial consonants of its first 1–`choseong_max_len` syllables become extra tokens, tagged with a `\x01` marker byte: 안녕하세요 → `\x01ㅇ`, `\x01ㅇㄴ`, `\x01ㅇㄴㅎ`. **Body words skip the single-jamo prefix** (length 1) to avoid over-broad matches — a lone `ㅇ` matches almost every Korean document — so body choseong starts at length 2. Title words keep length 1 so single-consonant queries still find title matches. At query time, a token consisting entirely of choseong jamo gets the same marker, so `ㅇㄴ` matches any document with a word whose initials start ㅇㄴ. No special-casing in the search path — marker tokens are looked up like any other token.
 
 ### Prefix tokens (`\x02`)
 
