@@ -78,7 +78,7 @@ pub fn write(allocator: std.mem.Allocator, input: IndexInput) ![]u8 {
                 const owned = try allocator.dupe(u8, t);
                 try expanded.?[i].append(allocator, owned);
             }
-            try choseong.addChoseongTokens(allocator, &expanded.?[i], input.choseong_max_len);
+            try choseong.addChoseongTokens(allocator, &expanded.?[i], 2, input.choseong_max_len);
         }
     }
 

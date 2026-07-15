@@ -22,10 +22,11 @@ const stopwords = @import("pipeline/stopwords.zig");
 //   tokens: zig, programming, wasm, fast, chaza
 // doc 2: title="안녕하세요", body="안녕하세요 친구 한글 chaza"
 //   tokens: 안녕하세요, 친구, 한글, chaza
-//   choseong: ㅇ ㅇㄴ ㅇㄴㅎ (안녕하세요), ㅊ ㅊㄱ (친구), ㅎ ㅎㄱ (한글)
+//   choseong (title ㅇ kept; body ㅊ ㅎ skipped at len 1):
+//     ㅇ (title) ㅇㄴ ㅇㄴㅎ (안녕하세요), ㅊㄱ (친구), ㅎㄱ (한글)
 // doc 3: title="Hello 안녕", body="hello 안녕 world chaza"
 //   tokens: hello, 안녕, world, chaza
-//   choseong: ㅇ ㅇㄴ (안녕)
+//   choseong: ㅇ (title) ㅇㄴ (안녕)
 // doc 4: title="Empty Body", body="chaza"
 //   tokens: empty, body, chaza
 //
@@ -150,7 +151,8 @@ test "golden determinism: stopword added → different index bytes" {
 /// (format, tokenization, prefix/choseong generation, filter construction).
 /// Update only for intentional pipeline/format changes.
 // Updated 2026-07: v1.4 format v3 — global lo(9-bit)/hi(16-bit) filters, pairKey(doc_id, token).
-const GOLDEN_INDEX_XXH64: u64 = 0x620ea16302c5c55b;
+// Updated 2026-07: body single-jamo choseong skipped (writer min_len=2), title keeps length-1.
+const GOLDEN_INDEX_XXH64: u64 = 0x48F8E3718FB7E6F1;
 
 test "golden hash: index bytes match pinned xxhash64" {
     const allocator = std.testing.allocator;
@@ -278,7 +280,7 @@ test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
     try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 0));
 }
 
-test "golden: search('ㅎ') → doc 2 only hit (ㅎ choseong starting word 한글)" {
+test "golden: search('ㅎ') → no hit (body-only single-jamo choseong skipped)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
@@ -287,11 +289,32 @@ test "golden: search('ㅎ') → doc 2 only hit (ㅎ choseong starting word 한�
     runtime.set_index(view.index.ptr, view.index.len);
     defer runtime.testCleanup();
 
+    // '한글' is body-only in doc 2; single-jamo choseong (\x01ㅎ) is not
+    // generated for body tokens (writer min_len=2). 'ㅎ' → 0 results.
     const q = "ㅎ";
     const r = runtime.search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 1), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(r, 0));
+    try std.testing.expectEqual(@as(u32, 0), resultCount(r));
+}
+
+test "golden: search('ㅇ') → docs 2, 3 hit (title single-jamo choseong preserved)" {
+    const allocator = std.testing.allocator;
+    const result = try buildGolden(allocator);
+    defer allocator.free(result.bundle_bytes);
+
+    const view = try bundle_mod.open(result.bundle_bytes);
+    runtime.set_index(view.index.ptr, view.index.len);
+    defer runtime.testCleanup();
+
+    // '안녕하세요' is a title word in doc 2; '안녕' is a title word in doc 3.
+    // Title tokens keep length-1 choseong (\x01ㅇ) from the generator.
+    const q = "ㅇ";
+    const r = runtime.search(q.ptr, q.len, 0);
+    const count = resultCount(r);
+
+    try std.testing.expect(count >= 2);
+    try std.testing.expect(resultContains(r, count, 2));
+    try std.testing.expect(resultContains(r, count, 3));
 }
 
 test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → input order)" {

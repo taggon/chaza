@@ -408,18 +408,19 @@ test "Korean token '안녕' search" {
     try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
 }
 
-test "Choseong query 'ㅇ' → 안녕 doc (doc 3) hit" {
+test "Choseong query 'ㅇ' → no hit (writer-level single-jamo choseong skipped)" {
     const allocator = std.testing.allocator;
     const bytes = try buildCorpus(allocator);
     defer allocator.free(bytes);
     set_index(bytes.ptr, bytes.len);
     defer testCleanup();
 
+    // Writer corpus tokens are body-level: single-jamo choseong (min_len=2)
+    // skips \x01ㅇ, so 'ㅇ' no longer matches '안녕'. Use 'ㅇㄴ' for 2-char match.
     const q = "ㅇ";
     const result = search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
+    try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
 
 test "Choseong query 'ㅇㄴ' → 안녕 doc (doc 3) hit (2-char prefix match)" {
@@ -456,9 +457,9 @@ test "Choseong query doesn't match normal Korean: 'ㅇ' ≠ '안녕' token" {
     set_index(bytes.ptr, bytes.len);
     defer testCleanup();
 
-    // 'ㅇ' choseong query converted to 0x01ㅇ marker token → different from original '안녕' token
-    // but since choseong token 0x01ㅇ exists in filter, doc 3 hit
-    const q = "ㅇ";
+    // 'ㅇㄴ' choseong query converted to 0x01ㅇㄴ marker token → different from '안녕' token
+    // but since choseong token 0x01ㅇㄴ exists in filter, doc 3 hit
+    const q = "ㅇㄴ";
     const result = search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));

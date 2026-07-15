@@ -141,7 +141,15 @@ pub fn generate(
                             try marked.append(a, try std.mem.concat(a, u8, &.{ &.{format.TITLE_MARKER}, tok }));
                             if (options.choseong_max_len > 0) {
                                 var cho: std.ArrayList([]const u8) = .empty;
-                                try choseong.extractPrefixes(a, tok, options.choseong_max_len, &cho);
+                                try choseong.extractPrefixes(a, tok, 1, options.choseong_max_len, &cho);
+                                // Title tokens keep length-1 regular choseong tokens
+                                // (body-only tokens skip them in the writer via min_len=2).
+                                if (cho.items.len > 0) {
+                                    if (!token_set.contains(cho.items[0])) {
+                                        try token_set.put(cho.items[0], {});
+                                        try token_list.append(a, cho.items[0]);
+                                    }
+                                }
                                 for (cho.items) |c| {
                                     try marked.append(a, try std.mem.concat(a, u8, &.{ &.{format.TITLE_MARKER}, c }));
                                 }
