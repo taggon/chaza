@@ -115,8 +115,8 @@ test "assemble: TailMeta magic/version/length fields byte-level verification" {
     try std.testing.expectEqual(@as(u8, 'A'), bundle[t + 2]);
     try std.testing.expectEqual(@as(u8, 'Z'), bundle[t + 3]);
 
-    // version = 2
-    try std.testing.expectEqual(@as(u8, 2), bundle[t + 4]);
+    // version = format.VERSION
+    try std.testing.expectEqual(format.VERSION, bundle[t + 4]);
 
     // _reserved = {0,0,0}
     try std.testing.expectEqual(@as(u8, 0), bundle[t + 5]);

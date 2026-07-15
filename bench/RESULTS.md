@@ -2,7 +2,7 @@
 
 Snapshot of a full `node bench/run.mjs` run. Reproduce with the steps in [README.md](README.md).
 
-- **Date**: 2026-07-10 (title-ranking tokens included)
+- **Date**: 2026-07-15 (v1.4 global two-tier filters: lo 9-bit + hi 16-bit)
 - **Environment**: Apple M1 Max, macOS, Node v22.18.0 (arm64)
 - **Versions**: chaza (this repo, `zig build -Doptimize=ReleaseFast`), tinysearch 0.10.0 (`--release`, warm cargo cache)
 - **Corpora**: Wikipedia extracts (Korean + English mixed), 100 / 500 / 1,000 documents, identical input file for both engines
@@ -12,26 +12,25 @@ Snapshot of a full `node bench/run.mjs` run. Reproduce with the steps in [README
 
 | corpus | metric | chaza | chaza w/o 초성+prefix¹ | tinysearch |
 |---|---|---|---|---|
-| 100 docs | index build (median) | **7.8 ms** | — | 4,568 ms |
-| | search latency | **5.2 µs/query** | — | 313 µs/query |
-| | output raw | 50.3 KB + 11.5 KB loader | 44.7 KB | 142.8 KB + 2.4 KB glue |
-| | output gzip | **24.7 KB** + 3.6 KB | 19.8 KB | 69.4 KB + 0.9 KB |
-| 500 docs | index build (median) | **47.1 ms** | — | 4,742 ms |
-| | search latency | **17.0 µs/query** | — | 444 µs/query |
-| | output gzip | 160.5 KB | **123.2 KB** | 156.2 KB |
-| 1,000 docs | index build (median) | **97.1 ms** | — | 4,725 ms |
-| | search latency | **29.8 µs/query** | — | 659 µs/query |
-| | output gzip | 328.2 KB | **251.2 KB** | 264.3 KB |
+| 100 docs | index build (median) | **6.3 ms** | — | 4,391 ms |
+| | search latency | **5.8 µs/query** | — | 316 µs/query |
+| | output raw | 45.8 KB + 11.5 KB loader | 39.1 KB | 134.2 KB + 2.4 KB glue |
+| | output gzip | **25.4 KB** + 3.5 KB | 19.5 KB | 60.4 KB + 0.9 KB |
+| 500 docs | index build (median) | **44.7 ms** | — | 4,484 ms |
+| | search latency | **21.4 µs/query** | — | 438 µs/query |
+| | output gzip | 161.6 KB | **120.7 KB** | 147.1 KB |
+| 1,000 docs | index build (median) | **94.2 ms** | — | 4,485 ms |
+| | search latency | **39.0 µs/query** | — | 648 µs/query |
+| | output gzip | 331.5 KB | **242.7 KB** | 255.1 KB |
 
 ¹ Feature-parity build (`bench/chaza-plain.json`): choseong and prefix tokens are chaza-only capabilities tinysearch does not have, so this column isolates their cost for an apples-to-apples size comparison.
 
 Notes:
 
-- chaza's build time scales linearly with corpus size; tinysearch's is dominated by the fixed ~4.6 s Rust crate compilation. The first-ever tinysearch build also compiles dependencies (minutes, not shown).
-- Search latency: both engines scan per document, so both scale linearly; the gap stays ~20–60×.
-- **The apparent size crossover is entirely feature cost.** With its full feature set (choseong + title prefix tokens) chaza reaches gzip parity with tinysearch around 500 docs and is ~20% larger at 1,000. At feature parity, chaza is smaller at every scale — 3.6× at 100 docs, 22% at 500, 6% at 1,000. Choseong + prefix cost ~74 KB gzip at 1,000 docs; that is the price of two capabilities tinysearch lacks, and both can be disabled per site.
-- gzip compresses chaza's binary-fuse fingerprints poorly (high-entropy bytes) while tinysearch's storage compresses well — that is why the raw-size gap (508 vs 447 KB at 1,000 docs) narrows after compression.
-- The built-in stopword list trims the filter section ~4% (e.g., 529 → 508 KB raw at 1,000 docs).
+- chaza's build time scales linearly with corpus size; tinysearch's is dominated by the fixed ~4.5 s Rust crate compilation. The first-ever tinysearch build also compiles dependencies (minutes, not shown).
+- Search latency: both engines scan per document, so both scale linearly; the gap stays ~20–55×. v1.4's global filter adds a few µs over v1.3's per-document filters (scattered probes into one large array) — irrelevant at this scale.
+- **The apparent size crossover is entirely feature cost.** With its full feature set (choseong + title prefix tokens) chaza reaches gzip parity with tinysearch around 500 docs and is ~30% larger at 1,000. At feature parity, chaza is smaller at every scale — 3.1× at 100 docs, 18% at 500, 5% at 1,000. Choseong + prefix cost ~89 KB gzip at 1,000 docs; that is the price of two capabilities tinysearch lacks, and both can be disabled per site.
+- v1.4's corpus-global filters are ~87% dense, so gzip barely compresses them — unlike v1.3's per-document filters, whose segment-rounding zero padding gzip absorbed. Raw size dropped 17% versus v1.3 (515 → 427 KB at 1,000 docs) while gzip stayed level (328 → 331 KB) — the structural saving was reinvested into wider fingerprints (see accuracy).
 
 ## Accuracy
 
@@ -46,28 +45,28 @@ Method (see `benchAccuracy` in `run.mjs`):
 | corpus | metric | chaza | tinysearch |
 |---|---|---|---|
 | 100 docs | recall@20 | **96.7%** | 87.5% |
-| | precision | 68.5% | 77.4% |
-| | false positives | 0.39%/doc | 0.27%/doc |
-| | known-item MRR@10 | **0.990** | 0.980 |
+| | precision | **89.2%** | 77.4% |
+| | false positives | **0.18%/doc** | 0.27%/doc |
+| | known-item MRR@10 | **0.990** | 0.970 |
 | | choseong retrieval | **100.0%** | — |
-| 500 docs | recall@20 | **97.5%** | 88.4% |
-| | precision | 35.1% | 43.2% |
-| | false positives | 0.36%/doc | 0.31%/doc |
-| | known-item MRR@10 | **0.992** | 0.969 |
+| 500 docs | recall@20 | **98.4%** | 88.4% |
+| | precision | **61.2%** | 43.2% |
+| | false positives | **0.18%/doc** | 0.31%/doc |
+| | known-item MRR@10 | **0.993** | 0.967 |
 | | choseong retrieval | **99.6%** | — |
-| 1,000 docs | recall@20 | **99.7%** | 92.0% |
-| | precision | 21.9% | 32.2% |
-| | false positives | 0.35%/doc | 0.31%/doc |
-| | known-item MRR@10 | **0.982** | 0.962 |
+| 1,000 docs | recall@20 | **99.8%** | 92.1% |
+| | precision | **48.2%** | 32.3% |
+| | false positives | **0.20%/doc** | 0.31%/doc |
+| | known-item MRR@10 | **0.989** | 0.964 |
 | | choseong retrieval | **97.3%** | — |
 
 ### Reading the numbers
 
-- **Recall**: chaza ~97–100% — its script-aware tokenizer segments punctuation- and script-boundary-attached words that tinysearch's whitespace split misses (87–92%). chaza's few misses are its own stopwords: the positive-query sample includes words like *the*/*of*, which chaza deliberately does not index (searching them is meaningless, but the neutral truth counts them).
-- **False positives**: chaza's measured 0.35–0.39%/doc matches the theoretical 1/256 ≈ 0.4% of its 8-bit binary fuse fingerprints. tinysearch measures slightly lower (0.27–0.31%).
-- **Precision** declines for both engines as the corpus grows — common-token queries return the 20-result page, and both engines pad it: chaza with prefix matches (its last-token prefix matching is counted against the strict exact-token truth) plus FP ties, tinysearch with its top-N scoring that always returns *something* even for weak matches.
-- **Known-item MRR: fixed by title-ranking tokens.** Ties on `hits` used to fall back to document input order, letting false positives and body-only matches rank above a true title match (MRR degraded to 0.38 at 1,000 docs). Title tokens are now duplicated with a `\x03` marker and probed at query time as a secondary sort key — a false positive would need to pass two independent probes (~0.002%). MRR@10 is now 0.98–0.99 at every scale, ahead of tinysearch's ~0.96–0.98, and choseong retrieval no longer collapses with corpus size (97–100%). Cost: ~2% bundle size.
+- **Recall**: chaza ~97–100% — its script-aware tokenizer segments punctuation- and script-boundary-attached words that tinysearch's whitespace split misses (88–92%). chaza's few misses are its own stopwords: the positive-query sample includes words like *the*/*of*, which chaza deliberately does not index (searching them is meaningless, but the neutral truth counts them).
+- **False positives: halved by v1.4.** chaza's measured 0.18–0.20%/doc matches the theoretical 2⁻⁹ ≈ 0.195% of the 9-bit fingerprints in its global lo filter (v1.3's 8-bit per-document filters measured 0.35–0.39%). Merging the per-document filters into one corpus-global filter recovered the space wasted by per-document sizing (~29% of the filter section) and reinvested it into the extra fingerprint bit — same gzip transfer size, half the false positives. chaza is now below tinysearch (0.27–0.31%) at every scale.
+- **Precision more than doubled** (21.9% → 48.2% at 1,000 docs) for two reasons: fewer filter false positives padding common-token result pages, and `\x02` prefix / `\x03` title-ranking tokens now living in a separate 16-bit "hi" filter (FP ≈ 0.0015%) — search-as-you-type matches are now essentially exact. The remaining gap to 100% is mostly chaza's last-token prefix matching being counted against the strict exact-token truth.
+- **Known-item MRR: held by title-ranking tokens.** Title tokens are duplicated with a `\x03` marker and probed at query time as a secondary sort key; since v1.4 these probes hit the 16-bit hi filter, so a false title signal must pass two independent probes (~0.2% × 0.0015%). MRR@10 stays 0.99 at every scale, ahead of tinysearch's ~0.96–0.97, and choseong retrieval holds at 97–100%.
 
 ## Overall
 
-At blog scale (≤ a few hundred documents) chaza wins build time (~650×), search latency (~55×), and transfer size (~3×) while beating tinysearch on recall, with choseong search as a capability tinysearch does not have. At feature parity chaza's output is smaller at every measured scale; with the Korean feature set enabled, gzip size reaches parity with tinysearch around 500 documents. With title-ranking tokens, known-item lookup quality (MRR@10 0.98+) now holds at every measured scale.
+At blog scale (≤ a few hundred documents) chaza wins build time (~700×), search latency (~55×), and transfer size (~2.4×) while beating tinysearch on recall, precision, false-positive rate, and known-item ranking, with choseong search as a capability tinysearch does not have. At feature parity chaza's output is smaller at every measured scale; with the Korean feature set enabled, gzip size reaches parity with tinysearch around 500 documents. v1.4's two-tier global filters halved the false-positive rate at the same transfer size — chaza's headline weakness versus tinysearch (filter noise) is gone.

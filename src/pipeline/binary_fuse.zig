@@ -1,38 +1,39 @@
-//! Binary Fuse Filter (BinaryFuse8) — pure Zig implementation.
+//! Binary Fuse Filter — pure Zig implementation, generalized fingerprint width.
 //!
 //! Zig port of C reference implementation from fastfilter `binaryfusefilter.h`
-//! (Thomas Mueller Graf, Daniel Lemire). Shares identical Zig hash code for
-//! population and lookup then eliminates C↔Zig bit mismatch risk.
+//! (Thomas Mueller Graf, Daniel Lemire), extended with a runtime-selectable
+//! fingerprint width (8~16 bits) stored as a bit-packed array. Shares identical
+//! Zig hash code for population and lookup then eliminates bit mismatch risk.
 //!
-//! 8-bit fingerprint. False positive rate ≈ 1/256 (0.4%). Fixed 3 lookups.
+//! False positive rate ≈ 2^-w for fingerprint width w. Fixed 3 lookups.
 //!
 //! Two hash layers:
 //!   1. chaza level (application): token → xxhash64 → u64 key (hash.zig key64)
-//!   2. filter level (internal): key → murmur64(key+seed) → 3 positions + 8-bit fingerprint
+//!   2. filter level (internal): key → murmur64(key+seed) → 3 positions + w-bit fingerprint
 
 const std = @import("std");
 
 const ARITY: u32 = 3;
 const MAX_ITERATIONS: u32 = 100;
 
-// ── Serialization blob header (28 bytes, little-endian) ──
-// At start of filter data pointed by DocEntry.filter_off.
+pub const MIN_FINGERPRINT_BITS: u5 = 8;
+pub const MAX_FINGERPRINT_BITS: u5 = 16;
+
+// ── Serialization blob header (32 bytes, little-endian) ──
 // segment_length_mask = segment_length - 1 (derivable, not stored).
 //
-// Blob header layout (offsets 0-27):
-//   Offset 0-7:   seed (u64) - used by BinaryFuse8View.fromBlob
-//   Offset 8-12:  size (u32) - stored but NOT used by BinaryFuse8View.fromBlob (unused at lookup)
-//   Offset 12-16: segment_length (u32) - used by BinaryFuse8View.fromBlob
-//   Offset 16-20: segment_count (u32) - stored but NOT used by BinaryFuse8View.fromBlob (unused at lookup)
-//   Offset 20-24: segment_count_length (u32) - used by BinaryFuse8View.fromBlob
-//   Offset 24-28: array_length (u32) - used by BinaryFuse8View.fromBlob
-//   Offset 28+:   fingerprints (array_length bytes) - used by BinaryFuse8View.fromBlob
-//
-// Note: size (offset 8-12) and segment_count (offset 16-20) are written by writeBlob but not
-// read by fromBlob. Changing their offsets would break the writeBlob/fromBlob offset agreement.
-// Future changes to fromBlob must maintain compatibility with existing blob data.
+// Blob header layout (offsets 0-31):
+//   Offset 0-7:   seed (u64) - used by BinaryFuseView.fromBlob
+//   Offset 8-11:  size (u32) - stored but NOT read at lookup (debug/tooling)
+//   Offset 12-15: segment_length (u32) - used by BinaryFuseView.fromBlob
+//   Offset 16-19: segment_count (u32) - stored but NOT read at lookup
+//   Offset 20-23: segment_count_length (u32) - used by BinaryFuseView.fromBlob
+//   Offset 24-27: array_length (u32) - used by BinaryFuseView.fromBlob
+//   Offset 28:    fingerprint_bits (u8) - used by BinaryFuseView.fromBlob
+//   Offset 29-31: zero padding
+//   Offset 32+:   bit-packed fingerprints (ceil(array_length * bits / 8) bytes)
 
-pub const FUSE_BLOB_HEADER_SIZE: usize = 28;
+pub const FUSE_BLOB_HEADER_SIZE: usize = 32;
 
 /// ── Hash utilities (same algorithm as C reference) ──
 
@@ -52,14 +53,10 @@ inline fn mixSplit(key: u64, seed: u64) u64 {
     return murmur64(key +% seed);
 }
 
-/// Fast modular reduction (C binary_fuse_reduce). hash * n >> 32.
-inline fn reduce(hash: u32, n: u32) u32 {
-    return @intCast((@as(u64, hash) * @as(u64, n)) >> 32);
-}
-
-/// 8-bit fingerprint (C binary_fuse8_fingerprint).
-inline fn fingerprint8(hash: u64) u8 {
-    return @truncate(hash ^ (hash >> 32));
+/// w-bit fingerprint (generalizes C binary_fuse8_fingerprint).
+inline fn fingerprintW(hash: u64, bits: u5) u16 {
+    const mask: u32 = (@as(u32, 1) << bits) - 1;
+    return @intCast((@as(u32, @truncate(hash ^ (hash >> 32)))) & mask);
 }
 
 /// Upper 64 bits of 64×64 multiplication (C binary_fuse_mulhi).
@@ -107,6 +104,42 @@ inline fn hashBatch(hash: u64, seg_len: u32, seg_count_len: u32, seg_len_mask: u
     ans.h1 ^= @as(u32, @truncate(hash >> 18)) & seg_len_mask;
     ans.h2 ^= @as(u32, @truncate(hash)) & seg_len_mask;
     return ans;
+}
+
+// ── Bit-packed fingerprint array ──
+//
+// Element i occupies bits [i*w, i*w + w). Reads/writes touch at most 3 bytes
+// (w ≤ 16, bit offset within byte ≤ 7 → 7 + 16 = 23 bits). Bounds-guarded so
+// the final element may end exactly at the buffer edge.
+
+/// Byte count of a packed array holding `count` elements of `bits` width.
+pub inline fn packedLen(count: u32, bits: u5) usize {
+    return (@as(usize, count) * bits + 7) / 8;
+}
+
+inline fn packedGet(bytes: []const u8, bits: u5, i: u32) u16 {
+    const bit: u64 = @as(u64, i) * bits;
+    const byte: usize = @intCast(bit >> 3);
+    const shift: u5 = @intCast(bit & 7);
+    var v: u32 = bytes[byte];
+    if (byte + 1 < bytes.len) v |= @as(u32, bytes[byte + 1]) << 8;
+    if (byte + 2 < bytes.len) v |= @as(u32, bytes[byte + 2]) << 16;
+    const mask: u32 = (@as(u32, 1) << bits) - 1;
+    return @intCast((v >> shift) & mask);
+}
+
+inline fn packedSet(bytes: []u8, bits: u5, i: u32, val: u16) void {
+    const bit: u64 = @as(u64, i) * bits;
+    const byte: usize = @intCast(bit >> 3);
+    const shift: u5 = @intCast(bit & 7);
+    const mask: u32 = ((@as(u32, 1) << bits) - 1) << shift;
+    var v: u32 = bytes[byte];
+    if (byte + 1 < bytes.len) v |= @as(u32, bytes[byte + 1]) << 8;
+    if (byte + 2 < bytes.len) v |= @as(u32, bytes[byte + 2]) << 16;
+    v = (v & ~mask) | (@as(u32, val) << shift);
+    bytes[byte] = @truncate(v);
+    if (byte + 1 < bytes.len) bytes[byte + 1] = @truncate(v >> 8);
+    if (byte + 2 < bytes.len) bytes[byte + 2] = @truncate(v >> 16);
 }
 
 // ── Parameter calculation (C binary_fuse_calculate_*) ──
@@ -164,31 +197,35 @@ pub fn computeParams(size: u32) Params {
     };
 }
 
-/// Total blob size in bytes for a filter holding size keys (28-byte header + fingerprints)
-pub fn blobSize(size: u32) usize {
-    return FUSE_BLOB_HEADER_SIZE + computeParams(size).array_length;
+/// Total blob size in bytes for a filter holding `size` keys at `bits` width
+/// (32-byte header + bit-packed fingerprints).
+pub fn blobSize(size: u32, bits: u5) usize {
+    return FUSE_BLOB_HEADER_SIZE + packedLen(computeParams(size).array_length, bits);
 }
 
 // ── Owned filter (for generator) ──
 
-pub const BinaryFuse8 = struct {
+pub const BinaryFuse = struct {
     seed: u64,
     size: u32,
     segment_length: u32,
     segment_count: u32,
     segment_count_length: u32,
     array_length: u32,
+    fingerprint_bits: u5,
+    /// Bit-packed fingerprint array (packedLen(array_length, fingerprint_bits) bytes).
     fingerprints: []u8,
     allocator: std.mem.Allocator,
 
-    inline fn segLenMask(self: BinaryFuse8) u32 {
+    inline fn segLenMask(self: BinaryFuse) u32 {
         return self.segment_length - 1;
     }
 
-    /// Allocate filter capable of holding size keys.
-    pub fn init(allocator: std.mem.Allocator, size: u32) !BinaryFuse8 {
+    /// Allocate filter capable of holding `size` keys with `bits`-wide fingerprints.
+    pub fn init(allocator: std.mem.Allocator, size: u32, bits: u5) !BinaryFuse {
+        std.debug.assert(bits >= MIN_FINGERPRINT_BITS and bits <= MAX_FINGERPRINT_BITS);
         const p = computeParams(size);
-        const fingerprints = try allocator.alloc(u8, p.array_length);
+        const fingerprints = try allocator.alloc(u8, packedLen(p.array_length, bits));
         @memset(fingerprints, 0);
 
         return .{
@@ -198,26 +235,30 @@ pub const BinaryFuse8 = struct {
             .segment_count = p.segment_count,
             .segment_count_length = p.segment_count_length,
             .array_length = p.array_length,
+            .fingerprint_bits = bits,
             .fingerprints = fingerprints,
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *BinaryFuse8) void {
+    pub fn deinit(self: *BinaryFuse) void {
         self.allocator.free(self.fingerprints);
     }
 
-    /// Returns true if the key is (probably) in the set. False positive rate ≈ 0.4%.
-    pub fn contains(self: BinaryFuse8, key: u64) bool {
+    /// Returns true if the key is (probably) in the set. False positive rate ≈ 2^-bits.
+    pub fn contains(self: BinaryFuse, key: u64) bool {
         const hash = mixSplit(key, self.seed);
-        const f = fingerprint8(hash);
+        const f = fingerprintW(hash, self.fingerprint_bits);
         const hb = hashBatch(hash, self.segment_length, self.segment_count_length, self.segLenMask());
-        const result = f ^ self.fingerprints[hb.h0] ^ self.fingerprints[hb.h1] ^ self.fingerprints[hb.h2];
+        const result = f ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h0) ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h1) ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h2);
         return result == 0;
     }
 
     /// Populate the filter. `keys` may be mutated (sorted/deduplicated in place).
-    pub fn populate(self: *BinaryFuse8, keys: []u64) !void {
+    pub fn populate(self: *BinaryFuse, keys: []u64) !void {
         var size: u32 = @intCast(keys.len);
         if (size != self.size) return error.SizeMismatch;
 
@@ -383,32 +424,31 @@ pub const BinaryFuse8 = struct {
         }
 
         // Assign fingerprints (in reverse peeling order)
+        const bits = self.fingerprint_bits;
         var i: u32 = size;
         while (i > 0) {
             i -= 1;
             const hash = reverse_order[i];
-            const xor2 = fingerprint8(hash);
+            const xor2 = fingerprintW(hash, bits);
             const found = reverse_h[i];
             h012[0] = hashPosition(0, hash, seg_len, seg_count_len, seg_len_mask);
             h012[1] = hashPosition(1, hash, seg_len, seg_count_len, seg_len_mask);
             h012[2] = hashPosition(2, hash, seg_len, seg_count_len, seg_len_mask);
             h012[3] = h012[0];
             h012[4] = h012[1];
-            self.fingerprints[h012[found]] = @truncate(
-                @as(u32, xor2) ^
-                    @as(u32, self.fingerprints[h012[found + 1]]) ^
-                    @as(u32, self.fingerprints[h012[found + 2]]),
-            );
+            packedSet(self.fingerprints, bits, h012[found], xor2 ^
+                packedGet(self.fingerprints, bits, h012[found + 1]) ^
+                packedGet(self.fingerprints, bits, h012[found + 2]));
         }
     }
 
-    /// Total serialized blob byte count = 28 (header) + array_length (fingerprints).
-    pub fn blobBytes(self: BinaryFuse8) usize {
-        return FUSE_BLOB_HEADER_SIZE + self.array_length;
+    /// Total serialized blob byte count = 32 (header) + packed fingerprint bytes.
+    pub fn blobBytes(self: BinaryFuse) usize {
+        return FUSE_BLOB_HEADER_SIZE + self.fingerprints.len;
     }
 
     /// Write blob header + fingerprints to buf. buf.len >= blobBytes required.
-    pub fn writeBlob(self: BinaryFuse8, buf: []u8) void {
+    pub fn writeBlob(self: BinaryFuse, buf: []u8) void {
         std.debug.assert(buf.len >= self.blobBytes());
         std.mem.writeInt(u64, buf[0..8], self.seed, .little);
         std.mem.writeInt(u32, buf[8..12], self.size, .little);
@@ -416,7 +456,11 @@ pub const BinaryFuse8 = struct {
         std.mem.writeInt(u32, buf[16..20], self.segment_count, .little);
         std.mem.writeInt(u32, buf[20..24], self.segment_count_length, .little);
         std.mem.writeInt(u32, buf[24..28], self.array_length, .little);
-        @memcpy(buf[28..][0..self.array_length], self.fingerprints);
+        buf[28] = self.fingerprint_bits;
+        buf[29] = 0;
+        buf[30] = 0;
+        buf[31] = 0;
+        @memcpy(buf[32..][0..self.fingerprints.len], self.fingerprints);
     }
 };
 
@@ -438,56 +482,93 @@ fn sortAndRemoveDup(keys: []u64, len: usize) u32 {
 // ── zero-copy view (for runtime) ──
 
 /// Create view from serialized blob bytes. No allocation.
-pub const BinaryFuse8View = struct {
+pub const BinaryFuseView = struct {
     seed: u64,
     segment_length: u32,
     segment_count_length: u32,
     segment_length_mask: u32,
+    fingerprint_bits: u5,
+    /// Bit-packed fingerprint array.
     fingerprints: []const u8,
 
-    /// Parse view from blob bytes. null if blob too short.
-    pub fn fromBlob(blob: []const u8) ?BinaryFuse8View {
+    /// Parse view from blob bytes. null if blob too short or width invalid.
+    pub fn fromBlob(blob: []const u8) ?BinaryFuseView {
         if (blob.len < FUSE_BLOB_HEADER_SIZE) return null;
         const seed = std.mem.readInt(u64, blob[0..8], .little);
         const seg_len = std.mem.readInt(u32, blob[12..16], .little);
         const seg_count_len = std.mem.readInt(u32, blob[20..24], .little);
         const array_length = std.mem.readInt(u32, blob[24..28], .little);
-        if (blob.len < FUSE_BLOB_HEADER_SIZE + array_length) return null;
-        const fingerprints = blob[28..][0..array_length];
+        const bits_raw = blob[28];
+        if (bits_raw < MIN_FINGERPRINT_BITS or bits_raw > MAX_FINGERPRINT_BITS) return null;
+        const bits: u5 = @intCast(bits_raw);
+        const fp_len = packedLen(array_length, bits);
+        if (blob.len < FUSE_BLOB_HEADER_SIZE + fp_len) return null;
+        const fingerprints = blob[FUSE_BLOB_HEADER_SIZE..][0..fp_len];
         return .{
             .seed = seed,
             .segment_length = seg_len,
             .segment_count_length = seg_count_len,
             .segment_length_mask = seg_len - 1,
+            .fingerprint_bits = bits,
             .fingerprints = fingerprints,
         };
     }
 
     /// Is key in set?
-    pub fn contains(self: BinaryFuse8View, key: u64) bool {
+    pub fn contains(self: BinaryFuseView, key: u64) bool {
         const hash = mixSplit(key, self.seed);
-        const f = fingerprint8(hash);
+        const f = fingerprintW(hash, self.fingerprint_bits);
         const hb = hashBatch(hash, self.segment_length, self.segment_count_length, self.segment_length_mask);
-        const result = f ^ self.fingerprints[hb.h0] ^ self.fingerprints[hb.h1] ^ self.fingerprints[hb.h2];
+        const result = f ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h0) ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h1) ^
+            packedGet(self.fingerprints, self.fingerprint_bits, hb.h2);
         return result == 0;
     }
 };
 
 // ── Assertion tests ────────────────────────────────────────────────────
 
+test "packedGet/packedSet: roundtrip across widths and offsets" {
+    var buf: [64]u8 = .{0} ** 64;
+    const widths = [_]u5{ 8, 9, 10, 11, 13, 16 };
+    for (widths) |w| {
+        @memset(&buf, 0);
+        const count: u32 = @intCast((buf.len * 8) / w);
+        const mask: u16 = @intCast((@as(u32, 1) << w) - 1);
+        // write a distinctive pattern to every slot, then read all back
+        for (0..count) |i| {
+            const val: u16 = @intCast((i *% 2654435761) & mask);
+            packedSet(&buf, w, @intCast(i), val);
+        }
+        for (0..count) |i| {
+            const val: u16 = @intCast((i *% 2654435761) & mask);
+            try std.testing.expectEqual(val, packedGet(&buf, w, @intCast(i)));
+        }
+    }
+}
+
+test "packedSet: neighbors survive interleaved writes (no bit bleed)" {
+    var buf: [16]u8 = .{0} ** 16;
+    const w: u5 = 11;
+    packedSet(&buf, w, 0, 0x7FF);
+    packedSet(&buf, w, 2, 0x555);
+    packedSet(&buf, w, 1, 0x2AA);
+    try std.testing.expectEqual(@as(u16, 0x7FF), packedGet(&buf, w, 0));
+    try std.testing.expectEqual(@as(u16, 0x2AA), packedGet(&buf, w, 1));
+    try std.testing.expectEqual(@as(u16, 0x555), packedGet(&buf, w, 2));
+}
+
 test "populate: output independent of allocator memory contents (uninit t2count/t2hash regression)" {
     // C reference callocs t2count/t2hash/reverse_order; a port that plain-allocs
-    // them reads garbage on the first iteration. Depending on the garbage this
-    // wasted a retry (different seed → different bytes), silently risked a wrong
-    // filter, or indexed h012 out of bounds and crashed in ReleaseFast.
-    // Building the same key set on top of 0x00-filled vs 0xFF-filled memory
-    // must yield byte-identical blobs.
+    // them reads garbage on the first iteration. Building the same key set on
+    // top of 0x00-filled vs 0xFF-filled memory must yield byte-identical blobs.
     var keys: [200]u64 = undefined;
     for (&keys, 0..) |*k, i| k.* = @as(u64, i) *% 0x9E3779B97F4A7C15;
 
     var blobs: [2][]u8 = undefined;
     var bufs: [2][64 * 1024]u8 = undefined;
-    var storage: [2][blobSize(200)]u8 = undefined;
+    var storage: [2][blobSize(200, 8)]u8 = undefined;
 
     for (0..2) |round| {
         @memset(&bufs[round], if (round == 0) 0x00 else 0xFF);
@@ -495,7 +576,7 @@ test "populate: output independent of allocator memory contents (uninit t2count/
         const a = fba.allocator();
 
         var keys_copy = keys;
-        var f = try BinaryFuse8.init(a, keys.len);
+        var f = try BinaryFuse.init(a, keys.len, 8);
         defer f.deinit();
         try f.populate(&keys_copy);
 
@@ -520,18 +601,32 @@ test "computeParams: size=0 → minimum filter" {
     try std.testing.expectEqual(@as(u32, 12), p.array_length);
 }
 
-test "blobSize: size=0 → 28 + 12 = 40" {
-    try std.testing.expectEqual(@as(usize, 40), blobSize(0));
+test "blobSize: size=0 → 32 + 12 (8-bit) / 32 + 24 (16-bit)" {
+    try std.testing.expectEqual(@as(usize, 44), blobSize(0, 8));
+    try std.testing.expectEqual(@as(usize, 56), blobSize(0, 16));
 }
 
 test "blobSize: monotonically increasing (approximately)" {
-    const s0 = blobSize(0);
-    const s10 = blobSize(10);
-    const s100 = blobSize(100);
-    const s1000 = blobSize(1000);
-    try std.testing.expect(s0 <= s10);
-    try std.testing.expect(s10 <= s100);
-    try std.testing.expect(s100 <= s1000);
+    const widths = [_]u5{ 8, 10, 16 };
+    for (widths) |w| {
+        const s0 = blobSize(0, w);
+        const s10 = blobSize(10, w);
+        const s100 = blobSize(100, w);
+        const s1000 = blobSize(1000, w);
+        try std.testing.expect(s0 <= s10);
+        try std.testing.expect(s10 <= s100);
+        try std.testing.expect(s100 <= s1000);
+    }
+}
+
+test "blobSize: wider fingerprints scale packed bytes proportionally" {
+    const p = computeParams(10000);
+    const bytes8 = blobSize(10000, 8) - FUSE_BLOB_HEADER_SIZE;
+    const bytes10 = blobSize(10000, 10) - FUSE_BLOB_HEADER_SIZE;
+    const bytes16 = blobSize(10000, 16) - FUSE_BLOB_HEADER_SIZE;
+    try std.testing.expectEqual(@as(usize, p.array_length), bytes8);
+    try std.testing.expectEqual(packedLen(p.array_length, 10), bytes10);
+    try std.testing.expectEqual(@as(usize, p.array_length) * 2, bytes16);
 }
 
 test "calculateSegmentLength: power of 2" {
@@ -548,95 +643,108 @@ test "calculateSegmentLength: upper limit bound even for large n" {
     try std.testing.expect((seg & (seg - 1)) == 0); // power of 2
 }
 
-test "BinaryFuse8: empty filter (size=0) — non-inserted keys mostly false" {
-    var f = try BinaryFuse8.init(std.testing.allocator, 0);
+test "BinaryFuse: empty filter (size=0) — non-inserted keys mostly false" {
+    var f = try BinaryFuse.init(std.testing.allocator, 0, 8);
     defer f.deinit();
     try f.populate(&.{});
-    // All fingerprints in empty filter are 0. contains(key) true only if fingerprint8(hash)==0 (≈0.4%).
-    // Try multiple keys to verify mostly false.
+    // All fingerprints in empty filter are 0. contains(key) true only if fingerprintW(hash)==0 (≈0.4%).
     var false_count: u32 = 0;
     for (0..1000) |i| {
         if (!f.contains(@as(u64, i))) false_count += 1;
     }
-    // Mostly not-contained; a few false positives are expected
     try std.testing.expect(false_count > 900);
 }
 
-test "BinaryFuse8: single key" {
-    var f = try BinaryFuse8.init(std.testing.allocator, 1);
+test "BinaryFuse: single key" {
+    var f = try BinaryFuse.init(std.testing.allocator, 1, 10);
     defer f.deinit();
     var keys = [_]u64{12345};
     try f.populate(&keys);
     try std.testing.expect(f.contains(12345));
 }
 
-test "BinaryFuse8: multiple keys — all inserted keys true" {
-    const n: u32 = 100;
-    var f = try BinaryFuse8.init(std.testing.allocator, n);
-    defer f.deinit();
+test "BinaryFuse: multiple keys — all inserted keys true (all widths)" {
+    const widths = [_]u5{ 8, 9, 10, 11, 16 };
+    for (widths) |w| {
+        const n: u32 = 100;
+        var f = try BinaryFuse.init(std.testing.allocator, n, w);
+        defer f.deinit();
 
-    var keys: [100]u64 = undefined;
-    for (0..n) |i| keys[i] = @as(u64, i * 1000 + 7);
-    try f.populate(&keys);
+        var keys: [100]u64 = undefined;
+        for (0..n) |i| keys[i] = @as(u64, i * 1000 + 7);
+        try f.populate(&keys);
 
-    for (keys) |k| {
-        try std.testing.expect(f.contains(k));
+        for (keys) |k| {
+            try std.testing.expect(f.contains(k));
+        }
     }
 }
 
-test "BinaryFuse8: non-inserted keys — mostly false" {
-    const n: u32 = 10000;
-    var f = try BinaryFuse8.init(std.testing.allocator, n);
-    defer f.deinit();
+test "BinaryFuse: false positive rate ≈ 2^-w per width" {
+    // 50k inserted keys, 200k non-inserted probes. Expected FP counts:
+    // w=8 → ~781, w=9 → ~391, w=10 → ~195, w=11 → ~98, w=16 → ~3. Verify
+    // each within a generous factor-2 band (chi-square noise stays well inside it).
+    const n: u32 = 50000;
+    const probes: u32 = 200000;
+    const widths = [_]u5{ 8, 9, 10, 11, 16 };
+    const expected = [_]f64{ 781.25, 390.6, 195.3, 97.7, 3.05 };
 
-    var keys: [10000]u64 = undefined;
-    for (0..n) |i| keys[i] = @as(u64, i * 2); // even
-    try f.populate(&keys);
+    const keys_buf = try std.testing.allocator.alloc(u64, n);
+    defer std.testing.allocator.free(keys_buf);
 
-    // Odd numbers not inserted → false positive rate ≈ 0.4%
-    var false_positives: u32 = 0;
-    const test_count: u32 = 10000;
-    for (0..test_count) |i| {
-        const odd_key = @as(u64, i * 2 + 1);
-        if (f.contains(odd_key)) false_positives += 1;
-    }
-    const fp_rate = @as(f64, @floatFromInt(false_positives)) / @as(f64, @floatFromInt(test_count));
-    // Theoretical ≈ 0.0039 (0.39%). Verify < 2% with margin.
-    try std.testing.expect(fp_rate < 0.02);
-}
+    for (widths, expected) |w, exp| {
+        for (0..n) |i| keys_buf[i] = @as(u64, i) * 2; // even keys inserted
+        var f = try BinaryFuse.init(std.testing.allocator, n, w);
+        defer f.deinit();
+        try f.populate(keys_buf);
 
-test "BinaryFuse8: serialize/deserialize roundtrip — identical lookup results" {
-    const n: u32 = 200;
-    var f = try BinaryFuse8.init(std.testing.allocator, n);
-    defer f.deinit();
-
-    var keys: [200]u64 = undefined;
-    for (0..n) |i| keys[i] = @as(u64, i * 31 + 17);
-    try f.populate(&keys);
-
-    // Write blob
-    const blob_size = f.blobBytes();
-    const blob = try std.testing.allocator.alloc(u8, blob_size);
-    defer std.testing.allocator.free(blob);
-    f.writeBlob(blob);
-
-    // Deserialize to view
-    const view = BinaryFuse8View.fromBlob(blob) orelse return error.UnexpectedNull;
-
-    // All inserted keys true
-    for (keys) |k| {
-        try std.testing.expect(view.contains(k));
-    }
-    // Non-inserted keys give same result as f.contains
-    for (0..500) |i| {
-        const k = @as(u64, i * 99 + 3);
-        try std.testing.expectEqual(f.contains(k), view.contains(k));
+        var fp: u32 = 0;
+        for (0..probes) |i| {
+            const odd_key = @as(u64, i) * 2 + 1; // never inserted
+            if (f.contains(odd_key)) fp += 1;
+        }
+        const fpf = @as(f64, @floatFromInt(fp));
+        try std.testing.expect(fpf < exp * 2.0 + 10.0);
+        try std.testing.expect(fpf > exp / 2.0 - 5.0);
     }
 }
 
-test "BinaryFuse8: large key set (1000) — all true" {
+test "BinaryFuse: serialize/deserialize roundtrip — identical lookup results (all widths)" {
+    const widths = [_]u5{ 8, 9, 10, 11, 16 };
+    for (widths) |w| {
+        const n: u32 = 200;
+        var f = try BinaryFuse.init(std.testing.allocator, n, w);
+        defer f.deinit();
+
+        var keys: [200]u64 = undefined;
+        for (0..n) |i| keys[i] = @as(u64, i * 31 + 17);
+        try f.populate(&keys);
+
+        // Write blob
+        const blob_size = f.blobBytes();
+        const blob = try std.testing.allocator.alloc(u8, blob_size);
+        defer std.testing.allocator.free(blob);
+        f.writeBlob(blob);
+
+        // Deserialize to view
+        const view = BinaryFuseView.fromBlob(blob) orelse return error.UnexpectedNull;
+        try std.testing.expectEqual(w, view.fingerprint_bits);
+
+        // All inserted keys true
+        for (keys) |k| {
+            try std.testing.expect(view.contains(k));
+        }
+        // Non-inserted keys give same result as f.contains
+        for (0..500) |i| {
+            const k = @as(u64, i * 99 + 3);
+            try std.testing.expectEqual(f.contains(k), view.contains(k));
+        }
+    }
+}
+
+test "BinaryFuse: large key set (1000) — all true" {
     const n: u32 = 1000;
-    var f = try BinaryFuse8.init(std.testing.allocator, n);
+    var f = try BinaryFuse.init(std.testing.allocator, n, 10);
     defer f.deinit();
 
     var keys: [1000]u64 = undefined;
@@ -653,7 +761,7 @@ test "BinaryFuse8: large key set (1000) — all true" {
     try std.testing.expect(all_found);
 }
 
-test "BinaryFuse8: same key set — deterministic (same seed to same result)" {
+test "BinaryFuse: same key set — deterministic (same seed to same result)" {
     const n: u32 = 50;
     const keys_a = try std.testing.allocator.alloc(u64, n);
     defer std.testing.allocator.free(keys_a);
@@ -664,11 +772,11 @@ test "BinaryFuse8: same key set — deterministic (same seed to same result)" {
         keys_b[i] = @as(u64, i * 7 + 3);
     }
 
-    var f1 = try BinaryFuse8.init(std.testing.allocator, n);
+    var f1 = try BinaryFuse.init(std.testing.allocator, n, 10);
     defer f1.deinit();
     try f1.populate(keys_a);
 
-    var f2 = try BinaryFuse8.init(std.testing.allocator, n);
+    var f2 = try BinaryFuse.init(std.testing.allocator, n, 10);
     defer f2.deinit();
     try f2.populate(keys_b);
 
@@ -676,13 +784,13 @@ test "BinaryFuse8: same key set — deterministic (same seed to same result)" {
     try std.testing.expectEqualSlices(u8, f1.fingerprints, f2.fingerprints);
 }
 
-test "BinaryFuse8View.fromBlob: too short blob → null" {
+test "BinaryFuseView.fromBlob: too short blob → null" {
     const tiny: [10]u8 = .{0} ** 10;
-    try std.testing.expect(BinaryFuse8View.fromBlob(&tiny) == null);
+    try std.testing.expect(BinaryFuseView.fromBlob(&tiny) == null);
 }
 
-test "BinaryFuse8View.fromBlob: correct header parsing" {
-    var f = try BinaryFuse8.init(std.testing.allocator, 10);
+test "BinaryFuseView.fromBlob: invalid fingerprint width → null" {
+    var f = try BinaryFuse.init(std.testing.allocator, 10, 8);
     defer f.deinit();
     var keys: [10]u64 = undefined;
     for (0..10) |i| keys[i] = @as(u64, i + 1);
@@ -692,11 +800,29 @@ test "BinaryFuse8View.fromBlob: correct header parsing" {
     defer std.testing.allocator.free(blob);
     f.writeBlob(blob);
 
-    const view = BinaryFuse8View.fromBlob(blob).?;
+    blob[28] = 0; // width below minimum
+    try std.testing.expect(BinaryFuseView.fromBlob(blob) == null);
+    blob[28] = 17; // width above maximum
+    try std.testing.expect(BinaryFuseView.fromBlob(blob) == null);
+}
+
+test "BinaryFuseView.fromBlob: correct header parsing" {
+    var f = try BinaryFuse.init(std.testing.allocator, 10, 11);
+    defer f.deinit();
+    var keys: [10]u64 = undefined;
+    for (0..10) |i| keys[i] = @as(u64, i + 1);
+    try f.populate(&keys);
+
+    const blob = try std.testing.allocator.alloc(u8, f.blobBytes());
+    defer std.testing.allocator.free(blob);
+    f.writeBlob(blob);
+
+    const view = BinaryFuseView.fromBlob(blob).?;
     try std.testing.expectEqual(f.seed, view.seed);
     try std.testing.expectEqual(f.segment_length, view.segment_length);
     try std.testing.expectEqual(f.segment_count_length, view.segment_count_length);
-    try std.testing.expectEqual(f.array_length, @as(u32, @intCast(view.fingerprints.len)));
+    try std.testing.expectEqual(f.fingerprint_bits, view.fingerprint_bits);
+    try std.testing.expectEqual(f.fingerprints.len, view.fingerprints.len);
     try std.testing.expectEqualSlices(u8, f.fingerprints, view.fingerprints);
 }
 
@@ -710,9 +836,9 @@ test "sortAndRemoveDup: remove duplicates" {
     try std.testing.expectEqual(@as(u64, 5), keys[3]);
 }
 
-test "BinaryFuse8: duplicate keys detected during populate" {
+test "BinaryFuse: duplicate keys detected during populate" {
     var keys = [_]u64{ 42, 42, 7, 7, 7, 100 };
-    var f = try BinaryFuse8.init(std.testing.allocator, keys.len);
+    var f = try BinaryFuse.init(std.testing.allocator, keys.len, 10);
     defer f.deinit();
     try f.populate(&keys);
 

@@ -149,8 +149,8 @@ test "golden determinism: stopword added → different index bytes" {
 /// this constant catches unintended output drift BETWEEN commits
 /// (format, tokenization, prefix/choseong generation, filter construction).
 /// Update only for intentional pipeline/format changes.
-// Updated 2026-07: title-marked (0x03) ranking tokens added to filters.
-const GOLDEN_INDEX_XXH64: u64 = 0x8b30fb551ea0dae2;
+// Updated 2026-07: v1.4 format v3 — global lo(9-bit)/hi(16-bit) filters, pairKey(doc_id, token).
+const GOLDEN_INDEX_XXH64: u64 = 0x620ea16302c5c55b;
 
 test "golden hash: index bytes match pinned xxhash64" {
     const allocator = std.testing.allocator;
@@ -164,19 +164,18 @@ test "golden hash: index bytes match pinned xxhash64" {
 
 // ── B. Build-query tokenization consistency ──
 
-test "golden consistency: all indexed tokens exist in corresponding document filter" {
+test "golden consistency: all indexed tokens exist in the global lo filter for their document" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
     defer allocator.free(result.bundle_bytes);
 
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
+    const fuse = binary_fuse.BinaryFuseView.fromBlob(idx.loFilter().?) orelse return error.UnexpectedNull;
 
     for (golden_doc_tokens) |dt| {
-        const filter_bytes = idx.docFilter(dt.doc_id).?;
-        const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
         for (dt.tokens) |tok| {
-            try std.testing.expect(fuse.contains(hash.key64(tok)));
+            try std.testing.expect(fuse.contains(hash.pairKey(hash.key64(tok), dt.doc_id)));
         }
     }
 }

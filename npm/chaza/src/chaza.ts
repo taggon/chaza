@@ -19,11 +19,11 @@
 /** Magic number. LE-serialized bytes spell 'C','H','A','Z'. */
 const MAGIC = 0x5a414843;
 /** Bundle format version. */
-const VERSION = 2;
+const VERSION = 3;
 /** Tail meta section size in bytes. */
 const TAIL_META_SIZE = 16;
-/** DocEntryPrefix: filter_off(4) + filter_len(4) + title_off(4) + title_len(4) + url_off(4) + url_len(4). */
-const DOC_ENTRY_PREFIX_SIZE = 24;
+/** DocEntryPrefix: title_off(4) + title_len(4) + url_off(4) + url_len(4). */
+const DOC_ENTRY_PREFIX_SIZE = 16;
 /** MetaEntry: off(4) + len(4). */
 const META_ENTRY_SIZE = 8;
 
@@ -247,10 +247,10 @@ export function getDocEntry(
   const docOff = header.docTableOff + docId * stride;
 
   // DocEntryPrefix
-  const titleOff = dv.getUint32(docOff + 8, true);
-  const titleLen = dv.getUint32(docOff + 12, true);
-  const urlOff = dv.getUint32(docOff + 16, true);
-  const urlLen = dv.getUint32(docOff + 20, true);
+  const titleOff = dv.getUint32(docOff, true);
+  const titleLen = dv.getUint32(docOff + 4, true);
+  const urlOff = dv.getUint32(docOff + 8, true);
+  const urlLen = dv.getUint32(docOff + 12, true);
 
   // MetaEntry[num_meta_fields]
   const metaValues: string[] = [];

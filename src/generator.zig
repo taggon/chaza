@@ -201,6 +201,21 @@ fn jsonValueToString(allocator: std.mem.Allocator, v: std.json.Value) ![]const u
 
 // ── Assertions ────────────────────────────────────────────────────
 
+const test_binary_fuse = @import("pipeline/binary_fuse.zig");
+const test_hash = @import("pipeline/hash.zig");
+
+/// Test helper: is (token, doc) in the global lo filter (regular/choseong tokens)?
+fn loContains(idx: reader.IndexView, doc_id: u32, tok: []const u8) bool {
+    const fuse = test_binary_fuse.BinaryFuseView.fromBlob(idx.loFilter().?).?;
+    return fuse.contains(test_hash.pairKey(test_hash.key64(tok), doc_id));
+}
+
+/// Test helper: is (token, doc) in the global hi filter (0x02/0x03 tokens)?
+fn hiContains(idx: reader.IndexView, doc_id: u32, tok: []const u8) bool {
+    const fuse = test_binary_fuse.BinaryFuseView.fromBlob(idx.hiFilter().?).?;
+    return fuse.contains(test_hash.pairKey(test_hash.key64(tok), doc_id));
+}
+
 test "Single document JSON → generate → return bundle bytes, open splits wasm/index" {
     const allocator = std.testing.allocator;
     const json =
@@ -374,15 +389,11 @@ test "Text in indexed_fields tokenized and exists in filter" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    // title + body tokens should be in binary fuse filter
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const filter_bytes = idx.docFilter(0).?;
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
-    try std.testing.expect(fuse.contains(hash.key64("zig")));
-    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
-    try std.testing.expect(fuse.contains(hash.key64("learn")));
-    try std.testing.expect(fuse.contains(hash.key64("wasm")));
+    // title + body tokens should be in the global lo filter
+    try std.testing.expect(loContains(idx, 0, "zig"));
+    try std.testing.expect(loContains(idx, 0, "tutorial"));
+    try std.testing.expect(loContains(idx, 0, "learn"));
+    try std.testing.expect(loContains(idx, 0, "wasm"));
 }
 
 test "Text from multiple indexed_fields concatenated and tokenized" {
@@ -398,16 +409,12 @@ test "Text from multiple indexed_fields concatenated and tokenized" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const filter_bytes = idx.docFilter(0).?;
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
     // title tokens
-    try std.testing.expect(fuse.contains(hash.key64("alpha")));
-    try std.testing.expect(fuse.contains(hash.key64("beta")));
+    try std.testing.expect(loContains(idx, 0, "alpha"));
+    try std.testing.expect(loContains(idx, 0, "beta"));
     // body tokens
-    try std.testing.expect(fuse.contains(hash.key64("gamma")));
-    try std.testing.expect(fuse.contains(hash.key64("delta")));
+    try std.testing.expect(loContains(idx, 0, "gamma"));
+    try std.testing.expect(loContains(idx, 0, "delta"));
 }
 
 test "Duplicate tokens added to filter only once" {
@@ -438,20 +445,15 @@ test "prefix_fields default (title): title-word prefixes in filter, body-word pr
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const filter_bytes = idx.docFilter(0).?;
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
-
-    // title word 'programming' → \x02pr .. \x02programm (k=2..8)
-    try std.testing.expect(fuse.contains(hash.key64("\x02pr")));
-    try std.testing.expect(fuse.contains(hash.key64("\x02progr")));
-    try std.testing.expect(fuse.contains(hash.key64("\x02programm")));
+    // title word 'programming' → \x02pr .. \x02programm (k=2..8) in the hi filter
+    try std.testing.expect(hiContains(idx, 0, "\x02pr"));
+    try std.testing.expect(hiContains(idx, 0, "\x02progr"));
+    try std.testing.expect(hiContains(idx, 0, "\x02programm"));
     // proper prefixes only — full word never gets a prefix token
-    try std.testing.expect(!fuse.contains(hash.key64("\x02programming")));
-    // body word 'tutorial' indexed exactly but gets no prefix tokens
-    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
-    try std.testing.expect(!fuse.contains(hash.key64("\x02tut")));
+    try std.testing.expect(!hiContains(idx, 0, "\x02programming"));
+    // body word 'tutorial' indexed exactly (lo) but gets no prefix tokens
+    try std.testing.expect(loContains(idx, 0, "tutorial"));
+    try std.testing.expect(!hiContains(idx, 0, "\x02tut"));
 }
 
 test "title tokens get 0x03-marked copies (incl. choseong); body tokens don't" {
@@ -467,20 +469,16 @@ test "title tokens get 0x03-marked copies (incl. choseong); body tokens don't" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
-
-    // title tokens: exact + 0x03 copy
-    try std.testing.expect(fuse.contains(hash.key64("zig")));
-    try std.testing.expect(fuse.contains(hash.key64("\x03zig")));
-    try std.testing.expect(fuse.contains(hash.key64("\x03안녕")));
-    // title choseong: 0x01 (writer) and 0x03+0x01 (generator title copy)
-    try std.testing.expect(fuse.contains(hash.key64("\x01\u{3147}")));
-    try std.testing.expect(fuse.contains(hash.key64("\x03\x01\u{3147}")));
+    // title tokens: exact (lo) + 0x03 copy (hi)
+    try std.testing.expect(loContains(idx, 0, "zig"));
+    try std.testing.expect(hiContains(idx, 0, "\x03zig"));
+    try std.testing.expect(hiContains(idx, 0, "\x03안녕"));
+    // title choseong: 0x01 (writer, lo) and 0x03+0x01 (generator title copy, hi)
+    try std.testing.expect(loContains(idx, 0, "\x01\u{3147}"));
+    try std.testing.expect(hiContains(idx, 0, "\x03\x01\u{3147}"));
     // body token: exact only, no title copy
-    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
-    try std.testing.expect(!fuse.contains(hash.key64("\x03tutorial")));
+    try std.testing.expect(loContains(idx, 0, "tutorial"));
+    try std.testing.expect(!hiContains(idx, 0, "\x03tutorial"));
 }
 
 test "prefix_fields=[] disables prefix tokens" {
@@ -496,11 +494,8 @@ test "prefix_fields=[] disables prefix tokens" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
-    try std.testing.expect(fuse.contains(hash.key64("programming")));
-    try std.testing.expect(!fuse.contains(hash.key64("\x02progr")));
+    try std.testing.expect(loContains(idx, 0, "programming"));
+    try std.testing.expect(!hiContains(idx, 0, "\x02progr"));
 }
 
 test "prefix_fields not subset of indexed_fields → error" {
@@ -527,15 +522,12 @@ test "stopworded words get no prefix tokens" {
     const view = try bundle_mod.open(result.bundle_bytes);
     const idx = try reader.IndexView.open(view.index);
 
-    const binary_fuse = @import("pipeline/binary_fuse.zig");
-    const hash = @import("pipeline/hash.zig");
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(idx.docFilter(0).?) orelse return error.UnexpectedNull;
     // stopword removed before prefix generation
-    try std.testing.expect(!fuse.contains(hash.key64("programming")));
-    try std.testing.expect(!fuse.contains(hash.key64("\x02progr")));
+    try std.testing.expect(!loContains(idx, 0, "programming"));
+    try std.testing.expect(!hiContains(idx, 0, "\x02progr"));
     // surviving word still gets prefixes
-    try std.testing.expect(fuse.contains(hash.key64("tutorial")));
-    try std.testing.expect(fuse.contains(hash.key64("\x02tut")));
+    try std.testing.expect(loContains(idx, 0, "tutorial"));
+    try std.testing.expect(hiContains(idx, 0, "\x02tut"));
 }
 
 test "With stopword set: tokens removed → smaller index" {
