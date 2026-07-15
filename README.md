@@ -19,13 +19,13 @@ Chaza is inspired by [tinysearch](https://github.com/tinysearch/tinysearch) and 
 
 | | chaza | tinysearch 0.10 | |
 |---|---|---|---|
-| Index build time | **6.3 ms** | 4.4 s | ~700× faster |
-| Search latency | **5.8 µs/query** | 316 µs/query | ~55× faster |
+| Index build time | **5.8 ms** | 4.5 s | ~750× faster |
+| Search latency | **6.0 µs/query** | 309 µs/query | ~50× faster |
 | Output size (gzip) | **25 KB** | 60 KB | ~2.4× smaller |
 | Recall@20 | **96.7%** | 87.5% | |
-| Precision | **89.2%** | 77.4% | |
-| Known-item MRR@10 | **0.99** | 0.97 | |
-| False positives | **0.18%/doc** | 0.27%/doc | |
+| Precision | **88.0%** | 77.4% | |
+| Known-item MRR@10 | **0.99** | 0.98 | |
+| False positives | **0.19%/doc** | 0.27%/doc | |
 | Korean choseong search | ✅ (100% retrieval) | ❌ | |
 | Single binary, no toolchain | ✅ | ❌ needs Rust + wasm toolchain | |
 
