@@ -1,6 +1,6 @@
 {
   "name": "chaza-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A minimal static-site search engine — Zig + WASM",
   "license": "MIT",
   "type": "module",
@@ -29,11 +29,11 @@
     "@types/node": "^22.20.0"
   },
   "optionalDependencies": {
-    "@chaza-cli/darwin-arm64": "0.1.0",
-    "@chaza-cli/darwin-x64": "0.1.0",
-    "@chaza-cli/linux-arm64": "0.1.0",
-    "@chaza-cli/linux-x64": "0.1.0",
-    "@chaza-cli/win32-arm64": "0.1.0",
-    "@chaza-cli/win32-x64": "0.1.0"
+    "@chaza-cli/darwin-arm64": "0.2.0",
+    "@chaza-cli/darwin-x64": "0.2.0",
+    "@chaza-cli/linux-arm64": "0.2.0",
+    "@chaza-cli/linux-x64": "0.2.0",
+    "@chaza-cli/win32-arm64": "0.2.0",
+    "@chaza-cli/win32-x64": "0.2.0"
   }
 }
