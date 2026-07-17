@@ -3,14 +3,16 @@
  *
  * Distributed as a static file. Shared by all sites.
  *
- * The bundle file (chaza.bundle) is not a pure WASM module — it is a
- * [wasm][index][tail-meta 16 B] container. This loader reads the tail meta,
- * slices the WASM and index sections, instantiates the WASM, and injects
- * the index.
+ * The chaza output (chaza.wasm) is a plain valid WASM module: the search
+ * index is embedded in it as a data segment, and its location is published
+ * through two exported globals (chaza_index_ptr / chaza_index_len). This
+ * loader instantiates the module (streaming when possible), reads the
+ * globals, and calls set_index(ptr, len) — the index bytes are already in
+ * wasm memory, no copy needed.
  *
  * Memory management:
  *   alloc(n) may grow wasm.memory.buffer, invalidating previous TypedArray views.
- *   Pattern: alloc -> copy index -> set_index. After set_index no grow occurs.
+ *   The index lives inside initial memory, so growth never moves or affects it.
  *   Each search() call creates fresh DataView/Uint8Array views for reading results.
  */
 
@@ -18,10 +20,8 @@
 
 /** Magic number. LE-serialized bytes spell 'C','H','A','Z'. */
 const MAGIC = 0x5a414843;
-/** Bundle format version. */
+/** Index format version. */
 const VERSION = 3;
-/** Tail meta section size in bytes. */
-const TAIL_META_SIZE = 16;
 /** DocEntryPrefix: title_off(4) + title_len(4) + url_off(4) + url_len(4). */
 const DOC_ENTRY_PREFIX_SIZE = 16;
 /** MetaEntry: off(4) + len(4). */
@@ -31,14 +31,6 @@ const _decoder = new TextDecoder("utf-8");
 const _encoder = new TextEncoder();
 
 // --- Types ---
-
-/** Parsed tail meta (last 16 bytes of the bundle). */
-export interface TailMeta {
-  magic: number;
-  version: number;
-  wasmLen: number;
-  indexLen: number;
-}
 
 /** Parsed index header (first 32 bytes of the index section). */
 export interface IndexHeader {
@@ -91,6 +83,9 @@ interface WasmExports {
     maxResults: number,
   ): number;
   memory: WebAssembly.Memory;
+  /** Index location globals injected by the chaza wasm patcher. */
+  chaza_index_ptr: WebAssembly.Global;
+  chaza_index_len: WebAssembly.Global;
 }
 
 /** Type guard for WASM exports. */
@@ -109,6 +104,14 @@ function asWasmExports(
   }
   if (!(e.memory instanceof WebAssembly.Memory)) {
     throw new Error("chaza: wasm export 'memory' not found");
+  }
+  if (
+    !(e.chaza_index_ptr instanceof WebAssembly.Global) ||
+    !(e.chaza_index_len instanceof WebAssembly.Global)
+  ) {
+    throw new Error(
+      "chaza: index globals not found — is this a chaza-built .wasm?",
+    );
   }
   return e as unknown as WasmExports;
 }
@@ -133,53 +136,6 @@ export function readU32LE(
           (bytes as Uint8Array).byteLength,
         );
   return dv.getUint32(offset, true);
-}
-
-/**
- * Parse the tail meta from the last 16 bytes of the bundle.
- * @throws if magic, version, or length validation fails.
- */
-export function parseTailMeta(bundleBytes: Uint8Array): TailMeta {
-  if (bundleBytes.length < TAIL_META_SIZE) {
-    throw new Error(
-      `chaza: bundle too short (${bundleBytes.length} < ${TAIL_META_SIZE})`,
-    );
-  }
-  const tailStart = bundleBytes.length - TAIL_META_SIZE;
-  const dv = new DataView(
-    bundleBytes.buffer,
-    bundleBytes.byteOffset + tailStart,
-    TAIL_META_SIZE,
-  );
-
-  const magic = dv.getUint32(0, true);
-  if (magic !== MAGIC) {
-    throw new Error(
-      `chaza: invalid tail magic 0x${magic.toString(16)} (expected 0x${MAGIC.toString(16)})`,
-    );
-  }
-
-  const version = dv.getUint8(4);
-  if (version !== VERSION) {
-    throw new Error(
-      `chaza: unsupported tail version ${version} (expected ${VERSION})`,
-    );
-  }
-
-  const wasmLen = dv.getUint32(8, true);
-  const indexLen = dv.getUint32(12, true);
-
-  // Verify wasm + index length matches bundle body (allow up to 3 bytes padding
-  // for 4-byte alignment added by the Zig assembler).
-  const expectedBody = bundleBytes.length - TAIL_META_SIZE;
-  const dataEnd = wasmLen + indexLen;
-  if (dataEnd > expectedBody || expectedBody - dataEnd > 3) {
-    throw new Error(
-      `chaza: tail meta length mismatch (wasm=${wasmLen} + index=${indexLen} = ${dataEnd}, but body is ${expectedBody})`,
-    );
-  }
-
-  return { magic, version, wasmLen, indexLen };
 }
 
 /**
@@ -308,62 +264,65 @@ export class Chaza {
   }
 
   /**
-   * Load a chaza bundle and return a ready-to-search instance.
+   * Load a chaza .wasm file and return a ready-to-search instance.
    *
-   * @param input - Bundle URL (string/URL), Response, ArrayBuffer, or Uint8Array.
+   * The index is embedded in the module as a data segment, so instantiation
+   * alone places it in wasm memory. URL/Response inputs use
+   * WebAssembly.instantiateStreaming when available (compile while
+   * downloading), falling back to a buffered instantiate if the server
+   * doesn't serve application/wasm.
+   *
+   * @param input - .wasm URL (string/URL), Response, ArrayBuffer, or Uint8Array.
    * @returns A Chaza instance.
    */
   static async load(
     input: string | URL | Response | ArrayBuffer | Uint8Array,
   ): Promise<Chaza> {
-    let bundleBytes: Uint8Array;
+    let instance: WebAssembly.Instance;
 
-    if (input instanceof Uint8Array) {
-      bundleBytes = input;
-    } else if (input instanceof ArrayBuffer) {
-      bundleBytes = new Uint8Array(input);
-    } else if (
-      typeof Response !== "undefined" &&
-      input instanceof Response
-    ) {
-      const ab = await input.arrayBuffer();
-      bundleBytes = new Uint8Array(ab);
+    if (input instanceof Uint8Array || input instanceof ArrayBuffer) {
+      const result = (await WebAssembly.instantiate(
+        input as BufferSource,
+      )) as WebAssembly.WebAssemblyInstantiatedSource;
+      instance = result.instance;
     } else {
-      // URL string or URL object — fetch
-      const resp = await fetch(input as string | URL);
-      if (!resp.ok) {
-        throw new Error(
-          `chaza: fetch failed (${resp.status} ${resp.statusText})`,
-        );
+      // URL string, URL object, or Response — streaming path
+      let resp: Response;
+      if (typeof Response !== "undefined" && input instanceof Response) {
+        resp = input;
+      } else {
+        resp = await fetch(input as string | URL);
+        if (!resp.ok) {
+          throw new Error(
+            `chaza: fetch failed (${resp.status} ${resp.statusText})`,
+          );
+        }
       }
-      const ab = await resp.arrayBuffer();
-      bundleBytes = new Uint8Array(ab);
+      if (typeof WebAssembly.instantiateStreaming === "function") {
+        try {
+          const result = await WebAssembly.instantiateStreaming(resp.clone());
+          instance = result.instance;
+        } catch {
+          // Wrong MIME type (not application/wasm) — buffered fallback
+          const ab = await resp.arrayBuffer();
+          const result = await WebAssembly.instantiate(ab);
+          instance = result.instance;
+        }
+      } else {
+        const ab = await resp.arrayBuffer();
+        const result = await WebAssembly.instantiate(ab);
+        instance = result.instance;
+      }
     }
 
-    // Parse tail meta
-    const { wasmLen, indexLen } = parseTailMeta(bundleBytes);
+    const exports = asWasmExports(instance.exports);
 
-    // Split wasm / index
-    const wasmBytes = bundleBytes.subarray(0, wasmLen);
-    const indexBytes = bundleBytes.subarray(wasmLen, wasmLen + indexLen);
+    // Index location comes from the patched-in exported globals; the bytes
+    // are already in memory via the data segment.
+    const indexPtr = (exports.chaza_index_ptr.value as number) >>> 0;
+    const indexLen = (exports.chaza_index_len.value as number) >>> 0;
 
-    // Instantiate wasm
-    const result = (await WebAssembly.instantiate(wasmBytes)) as unknown as
-      { module: WebAssembly.Module; instance: WebAssembly.Instance };
-    const exports = asWasmExports(result.instance.exports);
-
-    // Inject index into wasm memory
-    // alloc may grow memory — create a fresh view afterwards
-    const indexPtr = exports.alloc(indexLen);
-
-    const indexView = new Uint8Array(
-      exports.memory.buffer,
-      indexPtr,
-      indexLen,
-    );
-    indexView.set(indexBytes);
-
-    // set_index — no further grows after this point
+    // Register the index with the runtime
     exports.set_index(indexPtr, indexLen);
 
     // Cache header and meta names from the stable memory

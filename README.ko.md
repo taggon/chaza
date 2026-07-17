@@ -51,14 +51,14 @@ macOS, Linux (x64, arm64) 플랫폼별 바이너리가 자동 선택됩니다.
 
 ```bash
 # JSON 코퍼스에서 검색 인덱스 생성
-npx chaza build corpus.json -o chaza.bundle --config chaza.json
+npx chaza build corpus.json -o chaza.wasm --config chaza.json
 ```
 
 두 파일이 생성됩니다:
 
 | 파일 | 설명 |
 |------|------|
-| `chaza.bundle` | 번들: `[runtime.wasm][index][꼬리메타 16 B]`. **순수 WASM 모듈이 아님** — 로더를 거쳐 로드. |
+| `chaza.wasm` | 유효한 순수 WASM 모듈 — 검색 인덱스가 데이터 세그먼트로 내장되어 있습니다. |
 | `chaza.js` | 모든 사이트 공통 ESM 로더. |
 
 `--no-js` 옵션으로 로더 출력을 생략할 수 있습니다.
@@ -68,7 +68,7 @@ npx chaza build corpus.json -o chaza.bundle --config chaza.json
 ```html
 <script type="module">
   import { Chaza } from "chaza-cli";
-  const chaza = await Chaza.load("./chaza.bundle");
+  const chaza = await Chaza.load("./chaza.wasm");
   const results = chaza.search("ㄱㄴ");
 </script>
 ```
@@ -81,7 +81,7 @@ npx chaza build corpus.json -o chaza.bundle --config chaza.json
 chaza build <corpus.json> [옵션]
 
 옵션:
-  -o, --output <path>      출력 번들 경로 (기본: chaza.bundle)
+  -o, --output <path>      출력 wasm 경로 (기본: chaza.wasm)
   --config <path>          chaza.json 설정 파일 경로
   --stopwords <path>       불용어 파일 (내장 기본 리스트 대체,
                            빈 파일이면 제거 비활성)

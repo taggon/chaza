@@ -1,4 +1,5 @@
-//! chaza CLI — corpus JSON → searchable static bundle.
+//! chaza CLI — corpus JSON → self-contained searchable .wasm (index embedded
+//! as a data segment).
 //!
 //! Usage:
 //!   chaza build corpus.json [-o chaza.wasm] [--config config.json]
@@ -42,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
     const corpus_path = args[2];
 
     // Defaults
-    var output_path: []const u8 = "chaza.bundle";
+    var output_path: []const u8 = "chaza.wasm";
     var config_path: ?[]const u8 = null;
     var stopwords_path: ?[]const u8 = null;
     var no_choseong = false;
@@ -127,8 +128,8 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
 
-    // Write bundle
-    cwd.writeFile(io, .{ .sub_path = output_path, .data = result.bundle_bytes }) catch |err| {
+    // Write patched wasm
+    cwd.writeFile(io, .{ .sub_path = output_path, .data = result.wasm_bytes }) catch |err| {
         std.debug.print("chaza: cannot write '{s}': {}\n", .{ output_path, err });
         return err;
     };
@@ -153,9 +154,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("parsed {d} documents\n", .{result.num_docs});
         std.debug.print("stopwords: {d} entries ({s})\n", .{ sw_count, sw_source });
         std.debug.print("tokenized (choseong: {s}, max_len {d})\n", .{ choseong_status, options.choseong_max_len });
-        std.debug.print("wrote index: ~{d} bytes\n", .{result.index_size});
-        std.debug.print("embedded runtime wasm: {d} bytes\n", .{RUNTIME_WASM.len});
-        std.debug.print("→ {s} ({d} bytes)\n", .{ output_path, result.bundle_bytes.len });
+        std.debug.print("wrote index: ~{d} bytes (embedded as wasm data segment)\n", .{result.index_size});
+        std.debug.print("runtime wasm: {d} bytes\n", .{RUNTIME_WASM.len});
+        std.debug.print("→ {s} ({d} bytes)\n", .{ output_path, result.wasm_bytes.len });
     }
 }
 
@@ -217,7 +218,7 @@ fn printUsage() void {
         \\Usage: chaza build <corpus.json> [options]
         \\
         \\Options:
-        \\  -o, --output <path>      Output bundle path (default: chaza.bundle)
+        \\  -o, --output <path>      Output wasm path (default: chaza.wasm)
         \\  --config <path>          Path to chaza.json config file
         \\  --stopwords <path>       Stopwords file (line-separated; replaces built-in default,
         \\                           pass an empty file to disable removal)

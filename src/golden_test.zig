@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const generator = @import("generator.zig");
-const bundle_mod = @import("bundle.zig");
+const wasm_patch = @import("wasm_patch.zig");
 const reader = @import("index/reader.zig");
 const runtime = @import("runtime.zig");
 const binary_fuse = @import("pipeline/binary_fuse.zig");
@@ -81,9 +81,9 @@ fn resultContains(ptr: [*]const u8, count: u32, doc_id: u32) bool {
     return false;
 }
 
-/// Build bundle from golden corpus. caller free bundle_bytes.
+/// Build patched wasm from golden corpus. caller free wasm_bytes.
 fn buildGolden(allocator: std.mem.Allocator) !generator.GenerateResult {
-    return generator.generate(allocator, GOLDEN_JSON, &.{}, GOLDEN_OPTS);
+    return generator.generate(allocator, GOLDEN_JSON, &wasm_patch.test_minimal_wasm, GOLDEN_OPTS);
 }
 
 // ── A. Deterministic index generation ──
@@ -91,34 +91,38 @@ fn buildGolden(allocator: std.mem.Allocator) !generator.GenerateResult {
 test "golden determinism: same input twice → identical index bytes" {
     const allocator = std.testing.allocator;
     const r1 = try buildGolden(allocator);
-    defer allocator.free(r1.bundle_bytes);
+    defer allocator.free(r1.wasm_bytes);
     const r2 = try buildGolden(allocator);
-    defer allocator.free(r2.bundle_bytes);
+    defer allocator.free(r2.wasm_bytes);
 
     try std.testing.expectEqual(r1.index_size, r2.index_size);
 
-    const v1 = try bundle_mod.open(r1.bundle_bytes);
-    const v2 = try bundle_mod.open(r2.bundle_bytes);
-    try std.testing.expectEqualSlices(u8, v1.index, v2.index);
+    const idx1 = try wasm_patch.extractIndex(allocator, r1.wasm_bytes);
+    defer allocator.free(idx1);
+    const idx2 = try wasm_patch.extractIndex(allocator, r2.wasm_bytes);
+    defer allocator.free(idx2);
+    try std.testing.expectEqualSlices(u8, idx1, idx2);
 }
 
 test "golden determinism: different choseong_max_len → different index bytes" {
     const allocator = std.testing.allocator;
 
-    const r_off = try generator.generate(allocator, GOLDEN_JSON, &.{}, .{
+    const r_off = try generator.generate(allocator, GOLDEN_JSON, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .metadata_fields = &.{ "author", "date" },
         .choseong_max_len = 0,
     });
-    defer allocator.free(r_off.bundle_bytes);
+    defer allocator.free(r_off.wasm_bytes);
 
     const r_on = try buildGolden(allocator);
-    defer allocator.free(r_on.bundle_bytes);
+    defer allocator.free(r_on.wasm_bytes);
 
-    const v_off = try bundle_mod.open(r_off.bundle_bytes);
-    const v_on = try bundle_mod.open(r_on.bundle_bytes);
+    const i_off = try wasm_patch.extractIndex(allocator, r_off.wasm_bytes);
+    defer allocator.free(i_off);
+    const i_on = try wasm_patch.extractIndex(allocator, r_on.wasm_bytes);
+    defer allocator.free(i_on);
     // Filter fingerprint pattern differs due to choseong token presence
-    try std.testing.expect(!std.mem.eql(u8, v_on.index, v_off.index));
+    try std.testing.expect(!std.mem.eql(u8, i_on, i_off));
 }
 
 test "golden determinism: stopword added → different index bytes" {
@@ -126,21 +130,23 @@ test "golden determinism: stopword added → different index bytes" {
     var sw = try stopwords.StopwordSet.fromFileBytes(allocator, "hello\n");
     defer sw.deinit(allocator);
 
-    const r_sw = try generator.generate(allocator, GOLDEN_JSON, &.{}, .{
+    const r_sw = try generator.generate(allocator, GOLDEN_JSON, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .metadata_fields = &.{ "author", "date" },
         .choseong_max_len = 3,
         .stopwords = sw,
     });
-    defer allocator.free(r_sw.bundle_bytes);
+    defer allocator.free(r_sw.wasm_bytes);
 
     const r_no = try buildGolden(allocator);
-    defer allocator.free(r_no.bundle_bytes);
+    defer allocator.free(r_no.wasm_bytes);
 
-    const v_sw = try bundle_mod.open(r_sw.bundle_bytes);
-    const v_no = try bundle_mod.open(r_no.bundle_bytes);
+    const i_sw = try wasm_patch.extractIndex(allocator, r_sw.wasm_bytes);
+    defer allocator.free(i_sw);
+    const i_no = try wasm_patch.extractIndex(allocator, r_no.wasm_bytes);
+    defer allocator.free(i_no);
     // hello removed → filter fingerprint pattern different
-    try std.testing.expect(!std.mem.eql(u8, v_sw.index, v_no.index));
+    try std.testing.expect(!std.mem.eql(u8, i_sw, i_no));
 }
 
 // ── A2. Golden bytes hash regression ──
@@ -157,10 +163,11 @@ const GOLDEN_INDEX_XXH64: u64 = 0x48F8E3718FB7E6F1;
 test "golden hash: index bytes match pinned xxhash64" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const h = std.hash.XxHash64.hash(0, view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const h = std.hash.XxHash64.hash(0, index);
     try std.testing.expectEqual(GOLDEN_INDEX_XXH64, h);
 }
 
@@ -169,10 +176,11 @@ test "golden hash: index bytes match pinned xxhash64" {
 test "golden consistency: all indexed tokens exist in the global lo filter for their document" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     const fuse = binary_fuse.BinaryFuseView.fromBlob(idx.loFilter().?) orelse return error.UnexpectedNull;
 
     for (golden_doc_tokens) |dt| {
@@ -185,10 +193,11 @@ test "golden consistency: all indexed tokens exist in the global lo filter for t
 test "golden match: search('hello') → only documents with token hit (docs 0, 3)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "hello";
@@ -202,10 +211,11 @@ test "golden match: search('hello') → only documents with token hit (docs 0, 3
 test "golden match: search('hello') → documents without token miss (docs 1, 2, 4)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "hello";
@@ -222,10 +232,11 @@ test "golden match: search('hello') → documents without token miss (docs 1, 2,
 test "golden: search('안녕') → doc 3 (exact) + doc 2 (title prefix of 안녕하세요)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     // 안녕 exact hits doc 3 — and its title contains 안녕, so the 0x03 title
@@ -244,10 +255,11 @@ test "golden: search('안녕') → doc 3 (exact) + doc 2 (title prefix of 안녕
 test "golden prefix: search('hel') → title-word prefix hits docs 0, 3" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     // 'hel' exact matches nothing; prefix \x02hel comes from titles containing
@@ -263,10 +275,11 @@ test "golden prefix: search('hel') → title-word prefix hits docs 0, 3" {
 test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     // 'programming' exists in doc 0/1 bodies and doc 1 title.
@@ -283,10 +296,11 @@ test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
 test "golden: search('ㅎ') → no hit (body-only single-jamo choseong skipped)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     // '한글' is body-only in doc 2; single-jamo choseong (\x01ㅎ) is not
@@ -300,10 +314,11 @@ test "golden: search('ㅎ') → no hit (body-only single-jamo choseong skipped)"
 test "golden: search('ㅇ') → docs 2, 3 hit (title single-jamo choseong preserved)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     // '안녕하세요' is a title word in doc 2; '안녕' is a title word in doc 3.
@@ -320,10 +335,11 @@ test "golden: search('ㅇ') → docs 2, 3 hit (title single-jamo choseong preser
 test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → input order)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "hello world";
@@ -337,10 +353,11 @@ test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → inpu
 test "golden: empty query → count=0" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "";
@@ -352,10 +369,11 @@ test "golden: empty query → count=0" {
 test "golden: non-existent token → count=0" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "zzznonexistentzzz";
@@ -369,10 +387,11 @@ test "golden: non-existent token → count=0" {
 test "golden ranking: 'hello programming' → doc 0 (2 hits) first, then partial matches (1, 3)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "hello programming";
@@ -391,10 +410,11 @@ test "golden ranking: 'hello programming' → doc 0 (2 hits) first, then partial
 test "golden ranking: unknown token doesn't kill partial matches ('hello zzznonexistentzzz')" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "hello zzznonexistentzzz";
@@ -409,10 +429,11 @@ test "golden ranking: unknown token doesn't kill partial matches ('hello zzznone
 test "golden: max_results=2 → return max 2 (top-ranked first)" {
     const allocator = std.testing.allocator;
     const result = try buildGolden(allocator);
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    runtime.set_index(view.index.ptr, view.index.len);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    runtime.set_index(index.ptr, index.len);
     defer runtime.testCleanup();
 
     const q = "chaza";

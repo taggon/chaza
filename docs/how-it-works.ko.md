@@ -7,16 +7,16 @@
 ```
 빌드 시점                               런타임 (브라우저)
 ────────                               ─────────────────
-corpus.json ─┐                          fetch(chaza.bundle)
+corpus.json ─┐                          fetch(chaza.wasm)
 chaza.json  ─┤                            │
              ▼                            ▼
-        chaza CLI ──► chaza.bundle ──► chaza.js 로더
-       (runtime.wasm       │             ├─ 꼬리메타로 wasm / index 분리
-          내장)            │             ├─ wasm 인스턴스화
+        chaza CLI ──► chaza.wasm  ──► chaza.js 로더
+       (runtime.wasm       │             ├─ 인스턴스화 (스트리밍 가능)
+        패치)              │             ├─ chaza_index_ptr/len 글로벌 읽기
                            └─────────────┴─ set_index() → search()
 ```
 
-런타임 WASM은 **한 번만** 컴파일되어 CLI 바이너리에 내장됩니다. 인덱스를 만들 때는 아무것도 컴파일하지 않습니다 — CLI가 코퍼스를 토큰화하고 필터를 만들어 바이트를 이어붙일 뿐. 인덱스 빌드마다 Rust 크레이트를 생성·컴파일하는 tinysearch와의 핵심 차이입니다.
+런타임 WASM은 **한 번만** 컴파일되어 CLI 바이너리에 내장됩니다. 인덱스를 만들 때는 아무것도 컴파일하지 않습니다 — CLI가 코퍼스를 토큰화하고 필터를 만들어 인덱스 바이트를 런타임 모듈의 데이터 세그먼트로 패치해 넣을 뿐. 인덱스 빌드마다 Rust 크레이트를 생성·컴파일하는 tinysearch와의 핵심 차이입니다.
 
 ## 토큰화 파이프라인
 
@@ -92,15 +92,15 @@ v1.3까지는 문서마다 8비트 필터를 따로 만들었습니다. 문서 �
 
 OR 의미론에서는 토큰마다 모든 문서가 독립적으로 ~0.2% 오탐 확률을 가집니다. 토큰당 가짜 hit 기대치 ≈ N/512 문서. 상한이 없으면 아주 긴 쿼리는 전체 문서의 큰 비율을 잘못 매칭합니다. 16이면 최악에도 노이즈가 문서의 ~3% 수준이면서 현실적인 쿼리는 전혀 자르지 않습니다.
 
-## 번들 포맷
+## 출력 포맷
 
-```
-[runtime.wasm][인덱스 바이트][꼬리메타 16 B]
-```
+`chaza.wasm`은 유효한 순수 WASM 모듈입니다. CLI의 wasm 패처(`src/wasm_patch.zig`)가 미리 빌드된 런타임 모듈을 섹션 단위로 재작성하며 LEB128 길이 헤더를 다시 계산합니다:
 
-꼬리메타(little-endian): magic, version, `wasm_len`, `index_len`. 로더가 마지막 16바이트를 읽어 두 구역을 분리하고, WASM을 인스턴스화한 뒤 인덱스를 복사해 `set_index`를 호출합니다.
+- **memory 섹션**: 인덱스 영역이 초기 메모리 안에 들어가도록 초기 페이지 수 확장
+- **data 섹션**: 기존 메모리 끝(페이지 정렬)에 인덱스 바이트를 담은 active 데이터 세그먼트 1개 추가
+- **global + export 섹션**: 인덱스 위치를 알리는 불변 i32 글로벌 2개를 `chaza_index_ptr` / `chaza_index_len`으로 export
 
-WASM 데이터 섹션에 끼워 넣지 않고 **뒤에 이어붙이는** 이유: WASM 섹션은 LEB128 길이 헤더를 가져서 인덱스 크기가 바뀔 때마다 재계산이 필요하기 때문입니다. 그 결과 `chaza.bundle`은 유효한 WASM 모듈이 아니며 `WebAssembly.instantiateStreaming`에 직접 넣으면 실패합니다 — 항상 `chaza.js`를 거치세요.
+로더는 모듈을 인스턴스화하고 — `WebAssembly.instantiateStreaming`이 동작하므로 다운로드와 컴파일이 겹칩니다 — 글로벌 2개를 읽어 `set_index(ptr, len)`를 호출합니다. 인덱스 바이트는 데이터 세그먼트를 통해 이미 wasm 메모리에 올라와 있어 로드 시점 alloc/복사가 없습니다. 쿼리용 `alloc`으로 메모리가 늘어나도 wasm 선형 메모리는 이동하지 않으므로 인덱스 영역은 계속 유효합니다.
 
 인덱스 자체는 flat, 4바이트 정렬, little-endian 레이아웃(`[header][meta-names][doc-table][string-pool][filter-data]`, filter-data는 전역 blob 2개를 `[lo_len][hi_len][lo][hi]`로 보관)이고 런타임이 포인터 캐스트로 zero-parse로 읽습니다. 필드 단위 상세는 [SPEC.md](../SPEC.md) 참고.
 

@@ -5,5 +5,5 @@ dist/
 test-out/
 node_modules/
 coverage/
-demo/chaza.bundle
+demo/chaza.wasm
 demo/chaza.js

@@ -28,9 +28,6 @@
   "devDependencies": {
     "@types/node": "^22.20.0"
   },
-  "peerDependencies": {
-    "typescript": ">=6"
-  },
   "optionalDependencies": {
     "@chaza-cli/darwin-arm64": "0.1.0",
     "@chaza-cli/darwin-x64": "0.1.0",

@@ -35,9 +35,9 @@ jobs:
       - name: Build CLI
         run: zig build
 
-      - name: Build demo bundle
+      - name: Build demo wasm
         run: |
-          ./zig-out/bin/chaza build bench/corpus.json -o demo/chaza.bundle --config demo/chaza.json
+          ./zig-out/bin/chaza build bench/corpus.json -o demo/chaza.wasm --config demo/chaza.json
           cp npm/chaza/dist/chaza.js demo/chaza.js
 
       - name: Setup Pages
