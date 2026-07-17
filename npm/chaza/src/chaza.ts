@@ -254,6 +254,12 @@ export class Chaza {
   private _header!: IndexHeader;
   private _metaNames!: string[];
   private _stringPoolBase!: number;
+  /** Reused wasm-side query buffer — the runtime has no free(), so a fresh
+   * alloc per search would leak. Grown geometrically when a query outgrows
+   * it (the outgrown buffer is abandoned, bounding waste at ~2× the largest
+   * query seen). */
+  private _queryPtr = 0;
+  private _queryCap = 0;
 
   /** Exposed for testing. */
   get _header_pub(): IndexHeader {
@@ -363,9 +369,14 @@ export class Chaza {
 
     const exports = this._exports;
 
-    // Write query UTF-8 bytes into wasm memory
+    // Write query UTF-8 bytes into the reused wasm-side buffer
     const queryBytes = _encoder.encode(query);
-    const qPtr = exports.alloc(queryBytes.length);
+    if (queryBytes.length > this._queryCap) {
+      const newCap = Math.max(queryBytes.length, this._queryCap * 2, 256);
+      this._queryPtr = exports.alloc(newCap);
+      this._queryCap = newCap;
+    }
+    const qPtr = this._queryPtr;
 
     // alloc may have grown memory — fresh view
     const qView = new Uint8Array(
