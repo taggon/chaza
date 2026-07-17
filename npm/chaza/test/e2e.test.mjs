@@ -37,10 +37,11 @@ describe("e2e: single-token search", () => {
     );
   });
 
-  test("민법 → 1 hit", () => {
-    const results = chaza.search("민법");
+  test("롯폰기 힐스 모리 → 1 doc, 3 hits (no FP)", () => {
+    const results = chaza.search("롯폰기 힐스 모리");
     assert.equal(results.length, 1);
-    assert.equal(results[0].title, "대한민국 민법 제157조");
+    assert.equal(results[0].title, "롯폰기 힐스 모리 타워");
+    assert.equal(results[0].hits, 3);
   });
 
   test("올림픽 → multiple hits including 사격 doc", () => {
@@ -148,13 +149,13 @@ describe("e2e: maxResults", () => {
 
 describe("e2e: result structure", () => {
   test("result has title, url, meta, hits", () => {
-    const results = chaza.search("민법");
+    const results = chaza.search("롯폰기 힐스 모리");
     assert.equal(results.length, 1);
     const r = results[0];
     assert.equal(typeof r.title, "string");
     assert.equal(typeof r.url, "string");
     assert.ok(r.meta);
     assert.equal(typeof r.meta.path, "string");
-    assert.equal(r.hits, 1);
+    assert.equal(r.hits, 3);
   });
 });
