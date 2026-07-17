@@ -51,14 +51,14 @@ Platform binaries are auto-selected for macOS and Linux (x64, arm64).
 
 ```bash
 # Build a search index from a JSON corpus
-npx chaza build corpus.json -o chaza.bundle --config chaza.json
+npx chaza build corpus.json -o chaza.wasm --config chaza.json
 ```
 
 This produces two files:
 
 | File | Description |
 |------|-------------|
-| `chaza.bundle` | Bundle: `[runtime.wasm][index][tail-meta 16 B]`. **Not a pure WASM module** — load via the loader. |
+| `chaza.wasm` | A plain valid WASM module — the search index is embedded inside it as a data segment. |
 | `chaza.js` | ESM loader shared by all sites. |
 
 Add `--no-js` to skip writing the loader.
@@ -68,7 +68,7 @@ Add `--no-js` to skip writing the loader.
 ```html
 <script type="module">
   import { Chaza } from "chaza-cli";
-  const chaza = await Chaza.load("./chaza.bundle");
+  const chaza = await Chaza.load("./chaza.wasm");
   const results = chaza.search("ㄱㄴ");
 </script>
 ```
@@ -81,7 +81,7 @@ Each result contains `{ title, url, meta, hits }` — `hits` is the number of qu
 chaza build <corpus.json> [options]
 
 Options:
-  -o, --output <path>      Output bundle path (default: chaza.bundle)
+  -o, --output <path>      Output wasm path (default: chaza.wasm)
   --config <path>          Path to chaza.json config file
   --stopwords <path>       Stopwords file (replaces built-in default;
                            empty file disables removal)

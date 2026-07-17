@@ -13,12 +13,14 @@
 //! pairKey(doc_id, token key). lo = regular + choseong (0x01) tokens;
 //! hi = prefix (0x02) + title-ranking (0x03) tokens at a wider fingerprint.
 //!
-//! Bundle file order: [ runtime.wasm ][ index bytes ][ TailMeta 16B ]
+//! Distribution: the index bytes are embedded in the runtime wasm as an
+//! active data segment (see wasm_patch.zig) — the output file is a plain
+//! valid .wasm module, no container framing.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Bundle magic number. Serialized to file as LE gives byte order 'C','H','A','Z'.
+/// Index magic number. Serialized to file as LE gives byte order 'C','H','A','Z'.
 pub const MAGIC: u32 = 0x5A414843;
 
 /// Current index format version. Filter blobs are self-describing.
@@ -48,7 +50,6 @@ pub const PREFIX_MARKER: u8 = 0x02;
 pub const TITLE_MARKER: u8 = 0x03;
 
 pub const HEADER_SIZE: usize = @sizeOf(Header);
-pub const TAIL_META_SIZE: usize = @sizeOf(TailMeta);
 
 /// 1-layer tokenization algorithm (header's tokenizer_kind field).
 pub const TokenizerKind = enum(u8) {
@@ -101,15 +102,6 @@ pub const DocEntryPrefix = extern struct {
 pub const MetaEntry = extern struct {
     off: u32 = 0,
     len: u32 = 0,
-};
-
-/// Bundle tail metadata (16 bytes fixed, file end).
-pub const TailMeta = extern struct {
-    magic: u32 = MAGIC,
-    version: u8 = VERSION,
-    _reserved: [3]u8 = [_]u8{ 0, 0, 0 },
-    wasm_len: u32 = 0,
-    index_len: u32 = 0,
 };
 
 /// Total byte size of one DocEntry. = 16 + 8 * num_meta_fields.
@@ -166,17 +158,6 @@ test "docEntrySize calculation" {
     try std.testing.expectEqual(@as(usize, 16), docEntrySize(0));
     try std.testing.expectEqual(@as(usize, 24), docEntrySize(1));
     try std.testing.expectEqual(@as(usize, 40), docEntrySize(3));
-}
-
-test "TailMeta size and offsets (16 bytes fixed)" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(TailMeta));
-    try std.testing.expectEqual(@as(usize, 4), @alignOf(TailMeta));
-
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(TailMeta, "magic"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(TailMeta, "version"));
-    try std.testing.expectEqual(@as(usize, 5), @offsetOf(TailMeta, "_reserved"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(TailMeta, "wasm_len"));
-    try std.testing.expectEqual(@as(usize, 12), @offsetOf(TailMeta, "index_len"));
 }
 
 test "little-endian host assumed (wasm native = little-endian)" {

@@ -187,7 +187,7 @@ for (const CORPUS of CORPORA) {
 
   // ── 1. Index build time ──
   // --config indexes title+body, matching tinysearch's fixed schema (fair comparison)
-  const chazaBundle = path.join(outDir, "chaza.bundle");
+  const chazaBundle = path.join(outDir, "chaza.wasm");
   const chazaConfig = path.join(here, "chaza.json");
   const chazaBuild = timeRuns("chaza build      ", 20, () =>
     execFileSync(CHAZA, ["build", CORPUS, "--config", chazaConfig, "-o", chazaBundle, "-q"], { cwd: outDir }),
@@ -207,11 +207,11 @@ for (const CORPUS of CORPORA) {
 
   // Feature-parity size: choseong + prefix tokens are chaza-only capabilities
   // tinysearch lacks — build once without them to isolate their cost.
-  const chazaPlain = path.join(outDir, "chaza-plain.bundle");
+  const chazaPlain = path.join(outDir, "chaza-plain.wasm");
   execFileSync(CHAZA, ["build", CORPUS, "--config", path.join(here, "chaza-plain.json"), "-o", chazaPlain, "--no-js", "-q"], { cwd: outDir });
 
   console.log("\nsizes:");
-  console.log(`  chaza.bundle          ${kb(statSync(chazaBundle).size)} (gzip ${kb(gzSize(chazaBundle))})`);
+  console.log(`  chaza.wasm            ${kb(statSync(chazaBundle).size)} (gzip ${kb(gzSize(chazaBundle))})`);
   console.log(`  chaza w/o 초성+prefix ${kb(statSync(chazaPlain).size)} (gzip ${kb(gzSize(chazaPlain))}) — feature-parity vs tinysearch`);
   console.log(`  chaza.js loader       ${kb(statSync(chazaLoader).size)} (gzip ${kb(gzSize(chazaLoader))})`);
   console.log(`  tinysearch wasm       ${kb(statSync(tsWasm).size)} (gzip ${kb(gzSize(tsWasm))})`);

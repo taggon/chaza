@@ -231,7 +231,7 @@
     <div class="features">
       <span>⚡ ~5µs / query</span>
       <span>🔎 초성 검색 (ㅎㅂㅅ)</span>
-      <span>📦 48KB bundle</span>
+      <span>📦 46KB wasm</span>
     </div>
 
     <footer>
@@ -273,7 +273,7 @@
 
     async function init() {
       try {
-        chaza = await Chaza.load("./chaza.bundle");
+        chaza = await Chaza.load("./chaza.wasm");
         input.disabled = false;
         document.getElementById("init-msg").textContent = "검색어를 입력하거나 아래 예시를 눌러보세요.";
         input.focus();

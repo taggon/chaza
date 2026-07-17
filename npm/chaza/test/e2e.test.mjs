@@ -7,18 +7,58 @@ import { fileURLToPath } from "node:url";
 import { Chaza } from "../dist/chaza.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const bundle = readFileSync(path.join(__dirname, "fixtures", "chaza.bundle"));
+const wasm = readFileSync(path.join(__dirname, "fixtures", "chaza.wasm"));
 
 let chaza;
 
 before(async () => {
-  chaza = await Chaza.load(bundle);
+  chaza = await Chaza.load(wasm);
 });
 
 describe("e2e: load", () => {
+  test("fixture is a valid wasm module (WebAssembly.validate)", () => {
+    assert.ok(WebAssembly.validate(wasm));
+  });
+
   test("loads 50 documents with path metadata", () => {
     assert.equal(chaza._header_pub.numDocs, 50);
     assert.deepEqual(chaza._metaNames_pub, ["path"]);
+  });
+});
+
+describe("e2e: index integrity under memory growth", () => {
+  test("index bytes survive allocation-heavy searches", async () => {
+    const { createHash } = await import("node:crypto");
+    const fresh = await Chaza.load(wasm);
+
+    // Index location straight from the patched-in globals
+    const { instance } = await WebAssembly.instantiate(wasm);
+    const ptr = instance.exports.chaza_index_ptr.value >>> 0;
+    const len = instance.exports.chaza_index_len.value >>> 0;
+    assert.ok(len > 0);
+
+    // TS `private` is erased at runtime — reach into the instance under test
+    const mem = fresh._memory;
+    const snapshot = () =>
+      createHash("sha256")
+        .update(new Uint8Array(mem.buffer.slice(ptr, ptr + len)))
+        .digest("hex");
+
+    const before = snapshot();
+    const resultsBefore = fresh.search("대한민국").map((r) => r.title);
+    const pagesBefore = mem.buffer.byteLength;
+
+    // Huge queries force alloc → memory.grow (index sits in initial memory,
+    // grow must not disturb it)
+    const bigQuery = "대한민국 ".repeat(200_000); // ~2.6 MB UTF-8
+    for (let i = 0; i < 4; i++) fresh.search(bigQuery);
+    assert.ok(mem.buffer.byteLength > pagesBefore, "memory should have grown");
+
+    assert.equal(snapshot(), before, "index bytes changed after memory growth");
+    assert.deepEqual(
+      fresh.search("대한민국").map((r) => r.title),
+      resultsBefore,
+    );
   });
 });
 

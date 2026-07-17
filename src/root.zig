@@ -19,7 +19,7 @@ pub const pipeline = struct {
     pub const stopwords = @import("pipeline/stopwords.zig");
 };
 
-pub const bundle = @import("bundle.zig");
+pub const wasm_patch = @import("wasm_patch.zig");
 pub const runtime = @import("runtime.zig");
 pub const generator = @import("generator.zig");
 pub const golden_test = @import("golden_test.zig");
@@ -37,7 +37,7 @@ test {
     _ = pipeline.choseong;
     _ = pipeline.prefix;
     _ = pipeline.stopwords;
-    _ = bundle;
+    _ = wasm_patch;
     _ = runtime;
     _ = generator;
     _ = golden_test;

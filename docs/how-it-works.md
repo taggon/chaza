@@ -7,16 +7,16 @@ Internals of the index, the filters, and the search runtime. For usage, see the 
 ```
 build time                              runtime (browser)
 ──────────                              ─────────────────
-corpus.json ─┐                          fetch(chaza.bundle)
+corpus.json ─┐                          fetch(chaza.wasm)
 chaza.json  ─┤                            │
              ▼                            ▼
-        chaza CLI ──► chaza.bundle ──► chaza.js loader
-        (embeds           │              ├─ slice wasm / index via tail-meta
-       runtime.wasm)      │              ├─ instantiate wasm
+        chaza CLI ──► chaza.wasm  ──► chaza.js loader
+        (patches          │              ├─ instantiate (streaming-capable)
+       runtime.wasm)      │              ├─ read chaza_index_ptr/len globals
                           └──────────────┴─ set_index() → search()
 ```
 
-The runtime WASM is compiled **once** and embedded in the CLI binary. Building an index never compiles anything — the CLI tokenizes the corpus, builds filters, and concatenates bytes. This is the main difference from tinysearch, which generates and compiles a Rust crate per index.
+The runtime WASM is compiled **once** and embedded in the CLI binary. Building an index never compiles anything — the CLI tokenizes the corpus, builds filters, and patches the index bytes into the runtime module as a data segment. This is the main difference from tinysearch, which generates and compiles a Rust crate per index.
 
 ## Tokenization pipeline
 
@@ -92,15 +92,15 @@ The loader reads doc ids, then resolves title / url / metadata from the string p
 
 OR semantics means every token gives every document an independent ~0.2% false-positive chance. Expected fake hits per token ≈ N/512 documents. Without a cap, a very long query would falsely match a large fraction of all documents. 16 tokens keeps the noise floor at ~3% of documents in the worst case while never truncating a realistic query.
 
-## Bundle format
+## Output format
 
-```
-[runtime.wasm][index bytes][tail-meta 16 B]
-```
+`chaza.wasm` is a plain valid WASM module. The CLI's wasm patcher (`src/wasm_patch.zig`) rewrites the pre-built runtime module section by section, recomputing the LEB128 length headers:
 
-Tail meta (little-endian): magic, version, `wasm_len`, `index_len`. The loader reads the final 16 bytes, slices the two sections, instantiates the WASM, copies the index in, and calls `set_index`.
+- **memory section**: initial pages extended so the index region fits inside initial memory
+- **data section**: one active data segment at the old memory end (page-aligned) carrying the index bytes
+- **global + export sections**: two immutable i32 globals, exported as `chaza_index_ptr` / `chaza_index_len`, publish the index location
 
-Bytes are **appended**, not spliced into the WASM data section, because WASM sections carry LEB128 length headers that would need recomputing for every index size. Consequence: `chaza.bundle` is not a valid WASM module and `WebAssembly.instantiateStreaming` on it fails — always go through `chaza.js`.
+The loader instantiates the module — `WebAssembly.instantiateStreaming` works, so compilation overlaps the download — reads the two globals, and calls `set_index(ptr, len)`. The index bytes are already in wasm memory via the data segment; no alloc/copy happens at load time. Memory growth (from query `alloc`) never moves wasm linear memory, so the index region stays valid.
 
 The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`, with filter-data holding the two global blobs as `[lo_len][hi_len][lo][hi]`) that the runtime reads zero-parse via pointer casts. See [SPEC.md](../SPEC.md) for field-level detail.
 

@@ -36,7 +36,10 @@ pub fn alloc(n: usize) callconv(.c) [*]u8 {
     return buf.ptr;
 }
 
-/// Register index bytes. After set_index, memory grow prohibited (pointer invalidation).
+/// Register index bytes. In the browser, ptr/len come from the
+/// chaza_index_ptr/len globals the wasm patcher exported — the index data
+/// segment sits inside initial memory, so later memory growth (query alloc)
+/// never invalidates it (wasm linear memory doesn't move on grow).
 pub fn set_index(ptr: [*]const u8, len: usize) callconv(.c) void {
     const bytes = ptr[0..len];
     g_index = reader.IndexView.open(bytes) catch {

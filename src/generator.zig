@@ -1,14 +1,15 @@
-//! chaza generator: JSON corpus → index bytes → bundle bytes.
+//! chaza generator: JSON corpus → index bytes → patched wasm bytes.
 //!
 //! Parse tinysearch-compatible JSON document array:
 //! 1. Extract title, url, metadata fields from each document
 //! 2. Tokenize indexed_fields text to create unique token set
 //! 3. Configure writer.IndexInput → serialize index bytes
-//! 4. Generate [wasm][index][tailmeta] bundle via bundle.assemble
+//! 4. Embed the index into the runtime wasm as a data segment via
+//!    wasm_patch.embed — output is a self-contained valid .wasm module.
 
 const std = @import("std");
 const writer = @import("index/writer.zig");
-const bundle_mod = @import("bundle.zig");
+const wasm_patch = @import("wasm_patch.zig");
 const tokenize = @import("pipeline/tokenize.zig");
 const stopwords = @import("pipeline/stopwords.zig");
 const prefix = @import("pipeline/prefix.zig");
@@ -32,15 +33,15 @@ pub const GenerateOptions = struct {
 };
 
 pub const GenerateResult = struct {
-    /// [wasm][index][tailmeta]. caller free.
-    bundle_bytes: []u8,
+    /// Runtime wasm with the index embedded as a data segment. caller free.
+    wasm_bytes: []u8,
     num_docs: usize,
     index_size: usize,
 };
 
 /// corpus_json: tinysearch-compatible JSON document array.
-/// wasm_bytes: runtime wasm injected via @embedFile at build time (empty if none).
-/// allocator: for bundle bytes allocation. Internal allocations use internal arena.
+/// wasm_bytes: runtime wasm injected via @embedFile at build time.
+/// allocator: for output wasm allocation. Internal allocations use internal arena.
 pub fn generate(
     allocator: std.mem.Allocator,
     corpus_json: []const u8,
@@ -184,11 +185,11 @@ pub fn generate(
     // 4. Serialize index bytes
     const index_bytes = try writer.write(a, input);
 
-    // 5. Assemble bundle — allocated with caller allocator (caller free target)
-    const bundle_bytes = try bundle_mod.assemble(allocator, wasm_bytes, index_bytes);
+    // 5. Embed index into wasm — allocated with caller allocator (caller free target)
+    const out_wasm = try wasm_patch.embed(allocator, wasm_bytes, index_bytes);
 
     return .{
-        .bundle_bytes = bundle_bytes,
+        .wasm_bytes = out_wasm,
         .num_docs = docs_json.len,
         .index_size = index_bytes.len,
     };
@@ -224,26 +225,27 @@ fn hiContains(idx: reader.IndexView, doc_id: u32, tok: []const u8) bool {
     return fuse.contains(test_hash.pairKey(test_hash.key64(tok), doc_id));
 }
 
-test "Single document JSON → generate → return bundle bytes, open splits wasm/index" {
+test "Single document JSON → generate → valid wasm with extractable index" {
     const allocator = std.testing.allocator;
     const json =
         \\[{"title":"Hello World","url":"/hello","body":"hello world zig"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
     try std.testing.expectEqual(@as(usize, 1), result.num_docs);
     try std.testing.expect(result.index_size > 0);
 
-    // Verify bundle structure — wasm empty so wasm_len=0
-    const view = try bundle_mod.open(result.bundle_bytes);
-    try std.testing.expectEqual(@as(u32, 0), view.tail.wasm_len);
-    try std.testing.expectEqual(@as(u32, @intCast(result.index_size)), view.tail.index_len);
+    // Output is a wasm module carrying the index as a data segment
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x61, 0x73, 0x6D }, result.wasm_bytes[0..4]);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    try std.testing.expectEqual(result.index_size, index.len);
 
     // Verify index content
-    const idx = try reader.IndexView.open(view.index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqual(@as(u32, 1), idx.header.num_docs);
     try std.testing.expectEqualStrings("Hello World", idx.title(0).?);
     try std.testing.expectEqualStrings("/hello", idx.url(0).?);
@@ -257,16 +259,17 @@ test "2 document JSON, 2 meta fields" {
         \\  {"title":"Second","url":"/2","author":"bob","date":"2026-02-02"}
         \\]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{"title"},
         .metadata_fields = &.{ "author", "date" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
     try std.testing.expectEqual(@as(usize, 2), result.num_docs);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqual(@as(u32, 2), idx.header.num_docs);
     try std.testing.expectEqual(@as(u32, 2), idx.header.num_meta_fields);
 
@@ -279,24 +282,25 @@ test "2 document JSON, 2 meta fields" {
 
 test "Empty array JSON [] → num_docs=0" {
     const allocator = std.testing.allocator;
-    const result = try generate(allocator, "[]", &.{}, .{});
-    defer allocator.free(result.bundle_bytes);
+    const result = try generate(allocator, "[]", &wasm_patch.test_minimal_wasm, .{});
+    defer allocator.free(result.wasm_bytes);
 
     try std.testing.expectEqual(@as(usize, 0), result.num_docs);
     try std.testing.expect(result.index_size > 0); // header exists
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqual(@as(u32, 0), idx.header.num_docs);
 }
 
 test "Invalid JSON → error propagate" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.NotAnArray, generate(allocator, "{}", &.{}, .{}));
+    try std.testing.expectError(error.NotAnArray, generate(allocator, "{}", &wasm_patch.test_minimal_wasm, .{}));
     try std.testing.expectError(error.NotAnObject, generate(
         allocator,
         \\["not_an_object"]
-    , &.{}, .{}));
+    , &wasm_patch.test_minimal_wasm, .{}));
 }
 
 test "choseong_max_len=0 vs 3 → bundle size differs on sufficient corpus" {
@@ -306,17 +310,17 @@ test "choseong_max_len=0 vs 3 → bundle size differs on sufficient corpus" {
         \\[{"title":"강나루 새로운 아침 바람","url":"/a","body":"산책 하늘 구름 비 올 비행기 자동차 기차 버스 정거장 학교 교실 의자 책상 연필 지우개 공책 가방 우산 손수건"},{"title":"바다 갈매기 배 여행","url":"/b","body":"섬 등대 항구 어부 그물 물개 파도 모래 조개 해초 갯벌 등껍질 조류 파도 보트 요트 돛 닻 나침반"}]
     ;
 
-    const result_off = try generate(allocator, json, &.{}, .{
+    const result_off = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 0,
     });
-    defer allocator.free(result_off.bundle_bytes);
+    defer allocator.free(result_off.wasm_bytes);
 
-    const result_on = try generate(allocator, json, &.{}, .{
+    const result_on = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 3,
     });
-    defer allocator.free(result_on.bundle_bytes);
+    defer allocator.free(result_on.wasm_bytes);
 
     // Choseong tokens added → more keys → larger fuse blob → larger index
     try std.testing.expect(result_on.index_size > result_off.index_size);
@@ -327,13 +331,14 @@ test "Number meta value (views: 1000) stored as string '1000'" {
     const json =
         \\[{"title":"Post","url":"/p","views":1000}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .metadata_fields = &.{"views"},
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqualStrings("1000", idx.metaValue(0, 0).?);
 }
 
@@ -342,13 +347,14 @@ test "Fields not in metadata_fields ignored" {
     const json =
         \\[{"title":"T","url":"/u","extra":"should_be_ignored","views":42}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .metadata_fields = &.{},
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqual(@as(u32, 0), idx.header.num_meta_fields);
 }
 
@@ -357,31 +363,28 @@ test "Document without url_field → stored as empty string (no error)" {
     const json =
         \\[{"title":"No URL","path":"/some-path"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .url_field = "url",
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
     try std.testing.expectEqual(@as(usize, 1), result.num_docs);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
     try std.testing.expectEqualStrings("", idx.url(0).?);
     try std.testing.expectEqualStrings("No URL", idx.title(0).?);
 }
 
-test "wasm bytes included in bundle" {
+test "invalid runtime wasm → embed error propagates" {
     const allocator = std.testing.allocator;
     const fake_wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0xDE, 0xAD, 0xBE, 0xEF };
     const json =
         \\[{"title":"W","url":"/w"}]
     ;
-    const result = try generate(allocator, json, &fake_wasm, .{});
-    defer allocator.free(result.bundle_bytes);
-
-    const view = try bundle_mod.open(result.bundle_bytes);
-    try std.testing.expectEqualSlices(u8, &fake_wasm, view.wasm);
-    try std.testing.expectEqual(@as(u32, 8), view.tail.wasm_len);
+    // bad version bytes → patcher rejects
+    try std.testing.expectError(error.InvalidWasm, generate(allocator, json, &fake_wasm, .{}));
 }
 
 test "Text in indexed_fields tokenized and exists in filter" {
@@ -389,13 +392,14 @@ test "Text in indexed_fields tokenized and exists in filter" {
     const json =
         \\[{"title":"Zig Tutorial","url":"/zig","body":"learn zig wasm"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     // title + body tokens should be in the global lo filter
     try std.testing.expect(loContains(idx, 0, "zig"));
@@ -409,13 +413,14 @@ test "Text from multiple indexed_fields concatenated and tokenized" {
     const json =
         \\[{"title":"Alpha Beta","url":"/ab","body":"Gamma Delta"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     // title tokens
     try std.testing.expect(loContains(idx, 0, "alpha"));
@@ -430,10 +435,10 @@ test "Duplicate tokens added to filter only once" {
     const json =
         \\[{"title":"hello hello","url":"/h","body":"hello world"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
     // "hello" appears twice in title, once in body, but deduplicated to 1 token
     // Success without error sufficient — exact token count indirectly verified via bloom size
@@ -445,13 +450,14 @@ test "prefix_fields default (title): title-word prefixes in filter, body-word pr
     const json =
         \\[{"title":"Programming Guide","url":"/p","body":"tutorial content"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     // title word 'programming' → \x02pr .. \x02programm (k=2..8) in the hi filter
     try std.testing.expect(hiContains(idx, 0, "\x02pr"));
@@ -469,13 +475,14 @@ test "title tokens get 0x03-marked copies (incl. choseong); body tokens don't" {
     const json =
         \\[{"title":"Zig 안녕","url":"/z","body":"tutorial"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     // title tokens: exact (lo) + 0x03 copy (hi)
     try std.testing.expect(loContains(idx, 0, "zig"));
@@ -494,13 +501,14 @@ test "prefix_fields=[] disables prefix tokens" {
     const json =
         \\[{"title":"Programming Guide","url":"/p"}]
     ;
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .prefix_fields = &.{},
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     try std.testing.expect(loContains(idx, 0, "programming"));
     try std.testing.expect(!hiContains(idx, 0, "\x02progr"));
@@ -508,7 +516,7 @@ test "prefix_fields=[] disables prefix tokens" {
 
 test "prefix_fields not subset of indexed_fields → error" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.PrefixFieldNotIndexed, generate(allocator, "[]", &.{}, .{
+    try std.testing.expectError(error.PrefixFieldNotIndexed, generate(allocator, "[]", &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{"title"},
         .prefix_fields = &.{"body"},
     }));
@@ -522,13 +530,14 @@ test "stopworded words get no prefix tokens" {
     var sw = try StopwordSet.fromFileBytes(allocator, "programming\n");
     defer sw.deinit(allocator);
 
-    const result = try generate(allocator, json, &.{}, .{
+    const result = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .stopwords = sw,
     });
-    defer allocator.free(result.bundle_bytes);
+    defer allocator.free(result.wasm_bytes);
 
-    const view = try bundle_mod.open(result.bundle_bytes);
-    const idx = try reader.IndexView.open(view.index);
+    const index = try wasm_patch.extractIndex(allocator, result.wasm_bytes);
+    defer allocator.free(index);
+    const idx = try reader.IndexView.open(index);
 
     // stopword removed before prefix generation
     try std.testing.expect(!loContains(idx, 0, "programming"));
@@ -549,18 +558,18 @@ test "With stopword set: tokens removed → smaller index" {
     var sw = try StopwordSet.fromFileBytes(allocator, "alpha\nbeta\ngamma\ndelta\n");
     defer sw.deinit(allocator);
 
-    const result_without = try generate(allocator, json, &.{}, .{
+    const result_without = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 0,
     });
-    defer allocator.free(result_without.bundle_bytes);
+    defer allocator.free(result_without.wasm_bytes);
 
-    const result_with = try generate(allocator, json, &.{}, .{
+    const result_with = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 0,
         .stopwords = sw,
     });
-    defer allocator.free(result_with.bundle_bytes);
+    defer allocator.free(result_with.wasm_bytes);
 
     // 12 tokens (m=104bit) vs 8 tokens (m=72bit) → index size decreased
     try std.testing.expectEqual(@as(usize, 1), result_without.num_docs);
@@ -573,21 +582,21 @@ test "Stopword set null: no tokens removed (same as empty set)" {
         \\[{"title":"the quick brown fox","url":"/s","body":"the an of to"}]
     ;
 
-    const result_null = try generate(allocator, json, &.{}, .{
+    const result_null = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 0,
         .stopwords = null,
     });
-    defer allocator.free(result_null.bundle_bytes);
+    defer allocator.free(result_null.wasm_bytes);
 
     var empty_sw = try StopwordSet.fromFileBytes(allocator, "");
     defer empty_sw.deinit(allocator);
-    const result_empty = try generate(allocator, json, &.{}, .{
+    const result_empty = try generate(allocator, json, &wasm_patch.test_minimal_wasm, .{
         .indexed_fields = &.{ "title", "body" },
         .choseong_max_len = 0,
         .stopwords = empty_sw,
     });
-    defer allocator.free(result_empty.bundle_bytes);
+    defer allocator.free(result_empty.wasm_bytes);
 
     // null path (skip filter) and empty set path (filter pass, 0 matches) yield same result
     try std.testing.expectEqual(result_null.index_size, result_empty.index_size);
