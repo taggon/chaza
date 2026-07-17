@@ -1089,3 +1089,183 @@ test "sleb32 encode/decode roundtrip" {
         try std.testing.expectEqual(buf.items.len, off);
     }
 }
+
+// ── emitNewGlobalSection / emitNewExportSection / append-data paths ─────
+
+test "embed: module without global/export/data — all created from scratch" {
+    const allocator = std.testing.allocator;
+    // memory only — no global, export, or data sections present
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01, // memory: min 1
+    };
+    const index = [_]u8{ 1, 2, 3, 4 };
+    const patched = try embed(allocator, &module, &index);
+    defer allocator.free(patched);
+
+    var sections = try parseSections(allocator, patched);
+    defer sections.deinit(allocator);
+    var ids: std.ArrayList(u8) = .empty;
+    defer ids.deinit(allocator);
+    for (sections.items) |s| try ids.append(allocator, s.id);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ SEC_MEMORY, SEC_GLOBAL, SEC_EXPORT, SEC_DATA },
+        ids.items,
+    );
+
+    const loc = try indexLocation(patched);
+    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
+    try std.testing.expectEqual(@as(u32, 4), loc.len);
+
+    const extracted = try extractIndex(allocator, patched);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualSlices(u8, &index, extracted);
+}
+
+// ── readSimpleConstExpr: non-i32 const-expr branches ───────────────────
+
+test "indexLocation: walks globals with i64/f32/f64/global.get inits" {
+    const allocator = std.testing.allocator;
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // memory: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // global: 4 globals
+        0x06, 0x1F, 0x04,
+        // g0: i64 immut, i64.const 42
+        0x7E, 0x00, 0x42, 0x2A, 0x0B,
+        // g1: f32 immut, f32.const 1.0
+        0x7D, 0x00, 0x43, 0x00, 0x00, 0x80, 0x3F, 0x0B,
+        // g2: f64 immut, f64.const 1.0
+        0x7C, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x0B,
+        // g3: i32 immut, global.get 0
+        0x7F, 0x00, 0x23, 0x00, 0x0B,
+        // export "memory"
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    const index = [_]u8{ 10, 20, 30 };
+    const patched = try embed(allocator, &module, &index);
+    defer allocator.free(patched);
+
+    // chaza globals are at indices 4 and 5; indexLocation walks past the
+    // four non-chaza globals, exercising each const-expr branch.
+    const loc = try indexLocation(patched);
+    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
+    try std.testing.expectEqual(@as(u32, 3), loc.len);
+
+    const extracted = try extractIndex(allocator, patched);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualSlices(u8, &index, extracted);
+}
+
+test "readSimpleConstExpr: unsupported opcode and missing END rejected" {
+    const allocator = std.testing.allocator;
+    const index = [_]u8{ 1, 2, 3 };
+
+    // Global init with an unsupported opcode (0x00 = unreachable)
+    const bad_opcode = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // global: 1, i32 immut, opcode 0x00, end
+        0x06, 0x05, 0x01, 0x7F, 0x00, 0x00, 0x0B,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    {
+        const patched = try embed(allocator, &bad_opcode, &index);
+        defer allocator.free(patched);
+        try std.testing.expectError(error.UnsupportedConstExpr, indexLocation(patched));
+    }
+
+    // i32.const followed by wrong byte (0x01 instead of END 0x0B)
+    const missing_end = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // global: 1, i32 immut, i32.const 42, 0x01 (not END)
+        0x06, 0x06, 0x01, 0x7F, 0x00, 0x41, 0x2A, 0x01,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    {
+        const patched = try embed(allocator, &missing_end, &index);
+        defer allocator.free(patched);
+        try std.testing.expectError(error.UnsupportedConstExpr, indexLocation(patched));
+    }
+}
+
+// ── parseImports: import kind branches ─────────────────────────────────
+
+test "parseImports: func import (kind 0x00)" {
+    const allocator = std.testing.allocator;
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // import: 1, module "e", field "f", func, typeidx 0
+        0x02, 0x07, 0x01, 0x01, 'e', 0x01, 'f', 0x00, 0x00,
+        // memory: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export "memory"
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    const index = [_]u8{ 5, 6, 7 };
+    const patched = try embed(allocator, &module, &index);
+    defer allocator.free(patched);
+
+    // func import → 0 imported globals, 0 imported memories;
+    // chaza globals at indices 0 and 1
+    const loc = try indexLocation(patched);
+    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
+    try std.testing.expectEqual(@as(u32, 3), loc.len);
+
+    const extracted = try extractIndex(allocator, patched);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualSlices(u8, &index, extracted);
+}
+
+test "parseImports: table import (kind 0x01)" {
+    const allocator = std.testing.allocator;
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // import: 1, module "e", field "t", table, funcref, limits 0/0
+        0x02, 0x09, 0x01, 0x01, 'e', 0x01, 't', 0x01, 0x70, 0x00, 0x00,
+        // memory: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export "memory"
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    const index = [_]u8{ 8, 9 };
+    const patched = try embed(allocator, &module, &index);
+    defer allocator.free(patched);
+
+    const loc = try indexLocation(patched);
+    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
+    try std.testing.expectEqual(@as(u32, 2), loc.len);
+
+    const extracted = try extractIndex(allocator, patched);
+    defer allocator.free(extracted);
+    try std.testing.expectEqualSlices(u8, &index, extracted);
+}
+
+test "parseImports: tag import (kind 0x04) rejected" {
+    const allocator = std.testing.allocator;
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // import: 1, module "e", field "x", tag
+        0x02, 0x06, 0x01, 0x01, 'e', 0x01, 'x', 0x04,
+        // memory: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+    };
+    const index = [_]u8{1};
+    try std.testing.expectError(error.UnsupportedWasmFeature, embed(allocator, &module, &index));
+}
+
+test "parseImports: invalid import kind rejected" {
+    const allocator = std.testing.allocator;
+    const module = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // import: 1, module "e", field "x", kind 0x05 (invalid)
+        0x02, 0x06, 0x01, 0x01, 'e', 0x01, 'x', 0x05,
+        // memory: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+    };
+    const index = [_]u8{1};
+    try std.testing.expectError(error.InvalidWasm, embed(allocator, &module, &index));
+}
