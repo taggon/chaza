@@ -29,6 +29,7 @@ jobs:
       - name: Run tests with coverage
         id: kcov
         run: |
+          echo "runner epoch: $(date +%s)"
           zig build coverage
           path=$(find zig-out/coverage -name cov.xml | head -n1)
           if [ -z "$path" ]; then

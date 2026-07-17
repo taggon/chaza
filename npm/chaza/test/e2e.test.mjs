@@ -7,12 +7,12 @@ import { fileURLToPath } from "node:url";
 import { Chaza } from "../dist/chaza.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const bundle = readFileSync(path.join(__dirname, "fixtures", "chaza.bundle"));
+const wasm = readFileSync(path.join(__dirname, "fixtures", "chaza.wasm"));
 
 let chaza;
 
 before(async () => {
-  chaza = await Chaza.load(bundle);
+  chaza = await Chaza.load(wasm);
 });
 
 describe("e2e: load", () => {
