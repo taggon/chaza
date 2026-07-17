@@ -28,12 +28,13 @@ pub fn choseongToJamo(idx: u8) u21 {
 }
 
 /// Extract prefix choseong tokens from single token.
-/// Process only Hangul syllables, for each prefix length (1~min(Hangul count, max_len))
+/// Process only Hangul syllables, for each prefix length (min_len~min(Hangul count, max_len))
 /// add new buffer of 0x01 marker + choseong consonant UTF-8 combination to out.
 /// caller free each element of out.
 pub fn extractPrefixes(
     allocator: std.mem.Allocator,
     token: []const u8,
+    min_len: u8,
     max_len: u8,
     out: *std.ArrayList([]const u8),
 ) !void {
@@ -51,9 +52,10 @@ pub fn extractPrefixes(
         }
     }
 
-    // Generate prefix choseong tokens (length 1..min(Hangul count, max_len))
+    // Generate prefix choseong tokens (length min_len..min(Hangul count, max_len))
+    const start: usize = @max(@as(usize, min_len), 1);
     const limit = @min(jamo_list.items.len, @as(usize, max_len));
-    var len: usize = 1;
+    var len: usize = start;
     while (len <= limit) : (len += 1) {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
@@ -72,9 +74,11 @@ pub fn extractPrefixes(
 
 /// Add choseong prefix to entire token list (pipeline stage 5~6).
 /// Keep existing tokens + add choseong tokens + deduplicate.
+/// min_len controls the shortest prefix length to generate (1 = include single-jamo).
 pub fn addChoseongTokens(
     allocator: std.mem.Allocator,
     tokens: *std.ArrayList([]const u8),
+    min_len: u8,
     max_len: u8,
 ) !void {
     const original_len = tokens.items.len;
@@ -102,7 +106,7 @@ pub fn addChoseongTokens(
             prefixes.deinit(allocator);
         }
 
-        try extractPrefixes(allocator, tokens.items[i], max_len, &prefixes);
+        try extractPrefixes(allocator, tokens.items[i], min_len, max_len, &prefixes);
 
         for (prefixes.items) |prefix| {
             if (!seen.contains(prefix)) {
@@ -223,7 +227,7 @@ test "extractPrefixes: 안녕 max_len=3 → 2 tokens (ㅇ, ㅇㄴ)" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "안녕", 3, &out);
+    try extractPrefixes(allocator, "안녕", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
 
     // length 1: marker + ㅇ
@@ -241,7 +245,7 @@ test "extractPrefixes: 안녕하세요 max_len=3 → 3 tokens (ㅇ, ㅇㄴ, ㅇ�
     defer freeTokens(allocator, &out);
 
     // 안(ㅇ) 녕(ㄴ) 하(ㅎ) 세(ㅅ) 요(ㅇ) → prefixes 1~3: ㅇ, ㅇㄴ, ㅇㄴㅎ
-    try extractPrefixes(allocator, "안녕하세요", 3, &out);
+    try extractPrefixes(allocator, "안녕하세요", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 3), out.items.len);
 
     try std.testing.expectEqualStrings("\x01\u{3147}", out.items[0]);
@@ -254,7 +258,7 @@ test "extractPrefixes: hello max_len=3 → 0 tokens (not Hangul)" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "hello", 3, &out);
+    try extractPrefixes(allocator, "hello", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
@@ -263,7 +267,7 @@ test "extractPrefixes: empty string → 0 tokens" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "", 3, &out);
+    try extractPrefixes(allocator, "", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
@@ -272,7 +276,7 @@ test "extractPrefixes: 가 max_len=3 → 1 token (ㄱ)" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "가", 3, &out);
+    try extractPrefixes(allocator, "가", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqualStrings("\x01\u{3131}", out.items[0]);
 }
@@ -282,7 +286,7 @@ test "extractPrefixes: max_len=1 → length 1 prefixes only" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "안녕하세요", 1, &out);
+    try extractPrefixes(allocator, "안녕하세요", 1, 1, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqualStrings("\x01\u{3147}", out.items[0]);
 }
@@ -292,7 +296,7 @@ test "extractPrefixes: choseong tokens always start with 0x01 marker" {
     var out: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &out);
 
-    try extractPrefixes(allocator, "한글", 3, &out);
+    try extractPrefixes(allocator, "한글", 1, 3, &out);
     for (out.items) |tok| {
         try std.testing.expectEqual(@as(u8, 0x01), tok[0]);
     }
@@ -304,7 +308,7 @@ test "extractPrefixes: combining mark token — mark ignored" {
     defer freeTokens(allocator, &out);
 
     // 가\u{0301}: 가(ㄱ) + combining mark → 1 choseong
-    try extractPrefixes(allocator, "가\u{0301}", 3, &out);
+    try extractPrefixes(allocator, "가\u{0301}", 1, 3, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqualStrings("\x01\u{3131}", out.items[0]);
 }
@@ -318,7 +322,7 @@ test "addChoseongTokens: keep existing tokens + add choseong tokens + deduplicat
     try tokens.append(allocator, try allocator.dupe(u8, "안녕"));
     try tokens.append(allocator, try allocator.dupe(u8, "hello"));
 
-    try addChoseongTokens(allocator, &tokens, 3);
+    try addChoseongTokens(allocator, &tokens, 1, 3);
 
     // Original 2 + choseong 2 (ㅇ, ㅇㄴ) = 4
     try std.testing.expectEqual(@as(usize, 4), tokens.items.len);
@@ -338,7 +342,7 @@ test "addChoseongTokens: two words with same choseong → deduplicate" {
     try tokens.append(allocator, try allocator.dupe(u8, "안녕"));
     try tokens.append(allocator, try allocator.dupe(u8, "애니"));
 
-    try addChoseongTokens(allocator, &tokens, 3);
+    try addChoseongTokens(allocator, &tokens, 1, 3);
 
     // Original 2 + choseong 2 (ㅇ, ㅇㄴ — deduplicated)
     try std.testing.expectEqual(@as(usize, 4), tokens.items.len);
@@ -349,7 +353,7 @@ test "addChoseongTokens: empty list → no change" {
     var tokens: std.ArrayList([]const u8) = .empty;
     defer freeTokens(allocator, &tokens);
 
-    try addChoseongTokens(allocator, &tokens, 3);
+    try addChoseongTokens(allocator, &tokens, 1, 3);
     try std.testing.expectEqual(@as(usize, 0), tokens.items.len);
 }
 
@@ -361,7 +365,7 @@ test "addChoseongTokens: non-Hangul tokens only → no choseong" {
     try tokens.append(allocator, try allocator.dupe(u8, "hello"));
     try tokens.append(allocator, try allocator.dupe(u8, "world"));
 
-    try addChoseongTokens(allocator, &tokens, 3);
+    try addChoseongTokens(allocator, &tokens, 1, 3);
     try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
 }
 
@@ -375,7 +379,7 @@ test "Integrated pipeline: tokenize → addChoseongTokens" {
     try tokenize.tokenize(allocator, "안녕 hello", &tokens);
     try std.testing.expectEqual(@as(usize, 2), tokens.items.len);
 
-    try addChoseongTokens(allocator, &tokens, 3);
+    try addChoseongTokens(allocator, &tokens, 1, 3);
 
     // ["안녕", "hello", 0x01ㅇ, 0x01ㅇㄴ]
     try std.testing.expectEqual(@as(usize, 4), tokens.items.len);

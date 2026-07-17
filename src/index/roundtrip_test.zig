@@ -36,9 +36,9 @@ test "roundtrip: single document title/url/meta access" {
     try std.testing.expectEqualStrings("2026-01-01", view.metaValue(0, 0).?);
     try std.testing.expectEqualStrings("date", view.metaNameAt(0).?);
 
-    // filter exists (content verified in stand-alone test)
-    const filter = view.docFilter(0).?;
-    try std.testing.expect(filter.len > 0);
+    // global filters exist (content verified in stand-alone test)
+    try std.testing.expect(view.loFilter().?.len > 0);
+    try std.testing.expect(view.hiFilter().?.len > 0);
 }
 
 test "roundtrip: multiple documents, multiple meta" {
@@ -104,15 +104,14 @@ test "roundtrip: tokens recorded in binary fuse filter" {
     defer allocator.free(bytes);
 
     const view = try reader.IndexView.open(bytes);
-    const filter_bytes = view.docFilter(0).?;
 
-    // Deserialize as binary fuse filter view and verify contains
+    // Deserialize the global lo filter and verify (token, doc 0) membership
     const binary_fuse = @import("../pipeline/binary_fuse.zig");
     const hash = @import("../pipeline/hash.zig");
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return error.UnexpectedNull;
+    const fuse = binary_fuse.BinaryFuseView.fromBlob(view.loFilter().?) orelse return error.UnexpectedNull;
 
     for (tokens) |tok| {
-        try std.testing.expect(fuse.contains(hash.key64(tok)));
+        try std.testing.expect(fuse.contains(hash.pairKey(hash.key64(tok), 0)));
     }
 }
 
@@ -138,9 +137,11 @@ test "roundtrip: empty document(tokens=[]) also normal" {
     try std.testing.expectEqualStrings("/e", view.url(0).?);
     try std.testing.expectEqualStrings("none", view.metaValue(0, 0).?);
 
-    // filter blob minimum 40 bytes (28header + 12fingerprints)
-    const filter = view.docFilter(0).?;
-    try std.testing.expectEqual(@as(usize, 40), filter.len);
+    // empty corpus keys → minimum global blobs (32-byte header + packedLen(12, bits))
+    const binary_fuse = @import("../pipeline/binary_fuse.zig");
+    const format = @import("format.zig");
+    try std.testing.expectEqual(binary_fuse.blobSize(0, format.LO_FINGERPRINT_BITS), view.loFilter().?.len);
+    try std.testing.expectEqual(binary_fuse.blobSize(0, format.HI_FINGERPRINT_BITS), view.hiFilter().?.len);
 }
 
 test "roundtrip: out of bounds doc_id → null" {
@@ -158,6 +159,5 @@ test "roundtrip: out of bounds doc_id → null" {
     const view = try reader.IndexView.open(bytes);
     try std.testing.expect(view.title(1) == null);
     try std.testing.expect(view.url(1) == null);
-    try std.testing.expect(view.docFilter(1) == null);
     try std.testing.expect(view.docMetaEntries(1) == null);
 }

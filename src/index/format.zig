@@ -5,9 +5,13 @@
 //! Memory layout:
 //!   [ Header ]
 //!   [ Meta field name list ]   num_meta_fields NUL-terminated UTF-8 strings
-//!   [ Document metadata table ]   num_docs DocEntry (variable: 24 + 8*num_meta_fields bytes)
+//!   [ Document metadata table ]   num_docs DocEntry (variable: 16 + 8*num_meta_fields bytes)
 //!   [ String pool ]             title / url / meta value strings (NUL-delimited)
-//!   [ Filter data ]           Each document's filter blob ([FuseBlobHeader][fingerprints])
+//!   [ Filter data ]           [u32 lo_len][u32 hi_len][lo blob (4B-aligned)][hi blob]
+//!
+//! v1.4 filter data: two corpus-global binary fuse filters keyed by
+//! pairKey(doc_id, token key). lo = regular + choseong (0x01) tokens;
+//! hi = prefix (0x02) + title-ranking (0x03) tokens at a wider fingerprint.
 //!
 //! Bundle file order: [ runtime.wasm ][ index bytes ][ TailMeta 16B ]
 
@@ -18,7 +22,19 @@ const builtin = @import("builtin");
 pub const MAGIC: u32 = 0x5A414843;
 
 /// Current index format version. Filter blobs are self-describing.
-pub const VERSION: u8 = 2;
+/// v3: global lo/hi filters replace per-document filters; DocEntryPrefix
+/// shrinks to 16 bytes (filter_off/len removed).
+pub const VERSION: u8 = 3;
+
+/// Default fingerprint width (bits) of the global lo filter
+/// (regular + choseong tokens). FP ≈ 2^-w.
+pub const LO_FINGERPRINT_BITS: u5 = 9;
+
+/// Default fingerprint width (bits) of the global hi filter
+/// (prefix 0x02 + title-ranking 0x03 tokens). These feed
+/// search-as-you-type results and ranking, where false positives are
+/// directly user-visible — so they get a wider fingerprint.
+pub const HI_FINGERPRINT_BITS: u5 = 16;
 
 /// Prefix byte indicating choseong token.
 pub const CHOSEONG_MARKER: u8 = 0x01;
@@ -44,7 +60,7 @@ pub const TokenizerKind = enum(u8) {
 ///
 /// Format-level reservation for future filter kinds — only binary_fuse is
 /// implemented. Bloom (the original v1.0 filter) and xor were dropped in
-/// SPEC v1.2: BinaryFuse8 subsumes both (smaller, faster, lower FP rate),
+/// SPEC v1.2: BinaryFuse subsumes both (smaller, faster, lower FP rate),
 /// so no fallback exists. Writer always emits binary_fuse; reader/runtime
 /// assume it. A future kind needs its own blob layout + runtime dispatch.
 pub const FilterKind = enum(u8) {
@@ -69,13 +85,10 @@ pub const Header = extern struct {
     filters_off: u32 = 0,
 };
 
-/// Document metadata table entry fixed prefix (24 bytes).
+/// Document metadata table entry fixed prefix (16 bytes).
 /// Followed by num_meta_fields MetaEntries.
+/// v3: per-document filter_off/filter_len removed — filters are global.
 pub const DocEntryPrefix = extern struct {
-    /// This document's filter blob offset (filters section relative).
-    filter_off: u32 = 0,
-    /// Filter blob total length (including header).
-    filter_len: u32 = 0,
     /// Document title (string_pool relative).
     title_off: u32 = 0,
     title_len: u32 = 0,
@@ -99,7 +112,7 @@ pub const TailMeta = extern struct {
     index_len: u32 = 0,
 };
 
-/// Total byte size of one DocEntry. = 24 + 8 * num_meta_fields.
+/// Total byte size of one DocEntry. = 16 + 8 * num_meta_fields.
 pub inline fn docEntrySize(num_meta_fields: u32) usize {
     return @sizeOf(DocEntryPrefix) + @as(usize, num_meta_fields) * @sizeOf(MetaEntry);
 }
@@ -137,24 +150,22 @@ test "Header size and offsets (SPEC compliant)" {
 }
 
 test "DocEntryPrefix / MetaEntry sizes" {
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(DocEntryPrefix));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(DocEntryPrefix));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(MetaEntry));
 
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(DocEntryPrefix, "filter_off"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(DocEntryPrefix, "filter_len"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(DocEntryPrefix, "title_off"));
-    try std.testing.expectEqual(@as(usize, 12), @offsetOf(DocEntryPrefix, "title_len"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(DocEntryPrefix, "url_off"));
-    try std.testing.expectEqual(@as(usize, 20), @offsetOf(DocEntryPrefix, "url_len"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(DocEntryPrefix, "title_off"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(DocEntryPrefix, "title_len"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(DocEntryPrefix, "url_off"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(DocEntryPrefix, "url_len"));
 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(MetaEntry, "off"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(MetaEntry, "len"));
 }
 
 test "docEntrySize calculation" {
-    try std.testing.expectEqual(@as(usize, 24), docEntrySize(0));
-    try std.testing.expectEqual(@as(usize, 32), docEntrySize(1));
-    try std.testing.expectEqual(@as(usize, 48), docEntrySize(3));
+    try std.testing.expectEqual(@as(usize, 16), docEntrySize(0));
+    try std.testing.expectEqual(@as(usize, 24), docEntrySize(1));
+    try std.testing.expectEqual(@as(usize, 40), docEntrySize(3));
 }
 
 test "TailMeta size and offsets (16 bytes fixed)" {
@@ -183,12 +194,12 @@ test "Header defaults" {
 }
 
 test "metaEntries slicing" {
-    // DocEntryPrefix (24 bytes) + 3 MetaEntry (24 bytes) = 48 bytes
-    var storage: [48]u8 = .{0} ** 48;
+    // DocEntryPrefix (16 bytes) + 3 MetaEntry (24 bytes) = 40 bytes
+    var storage: [40]u8 = .{0} ** 40;
     const prefix: *DocEntryPrefix = @ptrCast(@alignCast(&storage));
 
     // Fill prefix
-    prefix.filter_off = 100;
+    prefix.title_off = 100;
     prefix.title_len = 42;
 
     // Fill 3 meta entries
@@ -199,8 +210,8 @@ test "metaEntries slicing" {
     metas[2].off = 9;
     metas[2].len = 10;
 
-    // Verify actual bytes placed after prefix (offset 24)
-    // metas[0].off @ 24, metas[2].len @ 24 + 2*8 + 4 = 44
-    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, storage[24..28], .little));
-    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, storage[44..48], .little));
+    // Verify actual bytes placed after prefix (offset 16)
+    // metas[0].off @ 16, metas[2].len @ 16 + 2*8 + 4 = 36
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, storage[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 10), std.mem.readInt(u32, storage[36..40], .little));
 }

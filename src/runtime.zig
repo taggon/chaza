@@ -1,9 +1,10 @@
 //! chaza runtime: WASM export API — in-memory search.
 //!
 //! For index bytes registered in global IndexView:
-//! query tokenization → each doc BinaryFuse8 filter OR lookup (hits = hit token count,
-//! title_hits = 0x03-probe hits) → sort by hits desc, title_hits desc, input order
-//! → result encoding.
+//! query tokenization → per document, probe the corpus-global lo filter with
+//! pairKey(doc_id, token key) (OR lookup; hits = hit token count) plus the hi
+//! filter for prefix (0x02) and title-ranking (0x03) probes → sort by hits
+//! desc, title_hits desc, input order → result encoding.
 //! Results written to global buffer in [u32 count LE][(u32 doc_id, u32 hits) × count LE] format.
 
 const std = @import("std");
@@ -94,13 +95,17 @@ pub fn search(
         keys[i] = .{ .exact = hash.key64(tok), .title = hash.key64(marked) };
     }
 
+    // Global filter views — parsed once per search, probed per (token, doc)
+    const lo_fuse = binary_fuse.BinaryFuseView.fromBlob(view.loFilter() orelse return writeEmptyResult()) orelse return writeEmptyResult();
+    const hi_fuse = binary_fuse.BinaryFuseView.fromBlob(view.hiFilter() orelse return writeEmptyResult()) orelse return writeEmptyResult();
+
     // Collect hit documents (OR: hits = hit token count, ≥1 is candidate)
     var candidates: std.ArrayList(ScoredDoc) = .empty;
     defer candidates.deinit(g_allocator);
 
     var doc_id: u32 = 0;
     while (doc_id < view.header.num_docs) : (doc_id += 1) {
-        const score = countHitTokens(view, doc_id, keys, last_prefix_key);
+        const score = countHitTokens(lo_fuse, hi_fuse, doc_id, keys, last_prefix_key);
         if (score.hits > 0) {
             candidates.append(g_allocator, .{
                 .doc_id = doc_id,
@@ -158,29 +163,27 @@ fn rankLessThan(_: void, a: ScoredDoc, b: ScoredDoc) bool {
     return a.doc_id < b.doc_id;
 }
 
-/// Count tokens hit in document's BinaryFuse8 filter (OR hits), plus title
-/// hits (0x03 probe — ranking-only signal, not part of `hits`). The last
-/// token also matches via its prefix token (last_prefix_key) —
-/// exact-or-prefix counts as one hit.
+/// Count tokens hit for one document (OR hits), plus title hits (0x03 probe
+/// in the hi filter — ranking-only signal, not part of `hits`). Exact tokens
+/// probe the global lo filter; the last token also matches via its prefix
+/// token in the hi filter — exact-or-prefix counts as one hit. All probes use
+/// pairKey(doc_id, token key).
 fn countHitTokens(
-    view: reader.IndexView,
+    lo_fuse: binary_fuse.BinaryFuseView,
+    hi_fuse: binary_fuse.BinaryFuseView,
     doc_id: u32,
     keys: []const TokenKeys,
     last_prefix_key: ?u64,
 ) Score {
-    const none: Score = .{ .hits = 0, .title_hits = 0 };
-    const filter_bytes = view.docFilter(doc_id) orelse return none;
-    if (filter_bytes.len == 0) return none;
-    const fuse = binary_fuse.BinaryFuse8View.fromBlob(filter_bytes) orelse return none;
-    var score = none;
+    var score: Score = .{ .hits = 0, .title_hits = 0 };
     for (keys, 0..) |k, i| {
-        var hit = fuse.contains(k.exact);
+        var hit = lo_fuse.contains(hash.pairKey(k.exact, doc_id));
         if (!hit and i == keys.len - 1) {
-            if (last_prefix_key) |pk| hit = fuse.contains(pk);
+            if (last_prefix_key) |pk| hit = hi_fuse.contains(hash.pairKey(pk, doc_id));
         }
         if (hit) {
             score.hits += 1;
-            if (fuse.contains(k.title)) score.title_hits += 1;
+            if (hi_fuse.contains(hash.pairKey(k.title, doc_id))) score.title_hits += 1;
         }
     }
     return score;
@@ -405,18 +408,19 @@ test "Korean token '안녕' search" {
     try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
 }
 
-test "Choseong query 'ㅇ' → 안녕 doc (doc 3) hit" {
+test "Choseong query 'ㅇ' → no hit (writer-level single-jamo choseong skipped)" {
     const allocator = std.testing.allocator;
     const bytes = try buildCorpus(allocator);
     defer allocator.free(bytes);
     set_index(bytes.ptr, bytes.len);
     defer testCleanup();
 
+    // Writer corpus tokens are body-level: single-jamo choseong (min_len=2)
+    // skips \x01ㅇ, so 'ㅇ' no longer matches '안녕'. Use 'ㅇㄴ' for 2-char match.
     const q = "ㅇ";
     const result = search(q.ptr, q.len, 0);
 
-    try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
+    try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
 
 test "Choseong query 'ㅇㄴ' → 안녕 doc (doc 3) hit (2-char prefix match)" {
@@ -453,9 +457,9 @@ test "Choseong query doesn't match normal Korean: 'ㅇ' ≠ '안녕' token" {
     set_index(bytes.ptr, bytes.len);
     defer testCleanup();
 
-    // 'ㅇ' choseong query converted to 0x01ㅇ marker token → different from original '안녕' token
-    // but since choseong token 0x01ㅇ exists in filter, doc 3 hit
-    const q = "ㅇ";
+    // 'ㅇㄴ' choseong query converted to 0x01ㅇㄴ marker token → different from '안녕' token
+    // but since choseong token 0x01ㅇㄴ exists in filter, doc 3 hit
+    const q = "ㅇㄴ";
     const result = search(q.ptr, q.len, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));

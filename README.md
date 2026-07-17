@@ -19,12 +19,13 @@ Chaza is inspired by [tinysearch](https://github.com/tinysearch/tinysearch) and 
 
 | | chaza | tinysearch 0.10 | |
 |---|---|---|---|
-| Index build time | **7.8 ms** | 4.6 s | ~600× faster |
-| Search latency | **5.2 µs/query** | 313 µs/query | ~60× faster |
-| Output size (gzip) | **25 KB** | 69 KB | ~3× smaller |
+| Index build time | **5.8 ms** | 4.5 s | ~750× faster |
+| Search latency | **6.0 µs/query** | 309 µs/query | ~50× faster |
+| Output size (gzip) | **25 KB** | 60 KB | ~2.4× smaller |
 | Recall@20 | **96.7%** | 87.5% | |
+| Precision | **88.0%** | 77.4% | |
 | Known-item MRR@10 | **0.99** | 0.98 | |
-| False positives | 0.39%/doc | 0.27%/doc | |
+| False positives | **0.19%/doc** | 0.27%/doc | |
 | Korean choseong search | ✅ (100% retrieval) | ❌ | |
 | Single binary, no toolchain | ✅ | ❌ needs Rust + wasm toolchain | |
 
@@ -147,7 +148,7 @@ Numbers are stringified automatically.
 ## Limitations
 
 - **Input must be UTF-8 + NFC.** NFD (decomposed) Hangul breaks choseong extraction.
-- **False positives.** ~0.4% of lookups may match a document that doesn't contain the token — inherent to the filter. Practical corpus ceiling is a few thousand documents.
+- **False positives.** ~0.2% of lookups may match a document that doesn't contain the token — inherent to the filter (title/prefix signals use a near-exact 16-bit tier). Practical corpus ceiling is a few thousand documents; designed and verified up to 1,000.
 - **Static index.** No incremental updates; rebuild to add or remove documents.
 - **Stopwords are not searchable.** A query made up entirely of stopwords returns nothing.
 

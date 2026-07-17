@@ -26,7 +26,7 @@ Shared by the indexer (native) and the runtime (wasm) as the same Zig code — b
 2. Segment by script group (Latin, Hangul, Han, Hiragana, Katakana, Number). A run of the same group is one token; a group switch is a token boundary. Combining marks attach to the preceding run.
 3. Remove stopwords (`--stopwords` file, if given)
 4. Deduplicate per document
-5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 1–`choseong_max_len`
+5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 2–`choseong_max_len` for body words; title words keep length 1–`choseong_max_len`
 6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints (proper prefixes only)
 7. Deduplicate again
 
@@ -40,7 +40,7 @@ Stopwords are removed **at index time only**. The list is not shipped in the bun
 
 ### Choseong tokens (`\x01`)
 
-For each Hangul word, the initial consonants of its first 1–`choseong_max_len` syllables become extra tokens, tagged with a `\x01` marker byte: 안녕하세요 → `\x01ㅇ`, `\x01ㅇㄴ`, `\x01ㅇㄴㅎ`. At query time, a token consisting entirely of choseong jamo gets the same marker, so `ㅇㄴ` matches any document with a word whose initials start ㅇㄴ. No special-casing in the search path — marker tokens are looked up like any other token.
+For each Hangul word, the initial consonants of its first 1–`choseong_max_len` syllables become extra tokens, tagged with a `\x01` marker byte: 안녕하세요 → `\x01ㅇ`, `\x01ㅇㄴ`, `\x01ㅇㄴㅎ`. **Body words skip the single-jamo prefix** (length 1) to avoid over-broad matches — a lone `ㅇ` matches almost every Korean document — so body choseong starts at length 2. Title words keep length 1 so single-consonant queries still find title matches. At query time, a token consisting entirely of choseong jamo gets the same marker, so `ㅇㄴ` matches any document with a word whose initials start ㅇㄴ. No special-casing in the search path — marker tokens are looked up like any other token.
 
 ### Prefix tokens (`\x02`)
 
@@ -50,27 +50,29 @@ Prefix lookups are impossible at the filter level (see below) — materializing 
 
 ### Title-ranking tokens (`\x03`)
 
-Tokens from the title field (and their choseong tokens) are indexed a second time with a `\x03` marker. At query time every token is also probed as `\x03`-marked; the count (`title_hits`) is a **ranking-only** signal — it never changes `hits` or the JS API. On equal `hits`, documents whose *title* matches outrank body-only matches and false positives (a false positive would have to pass two independent probes, ~0.4%² ≈ 0.002%). This lifted known-item MRR@10 from 0.38 to 0.98 on a 1,000-document corpus for ~2% extra bundle size.
+Tokens from the title field (and their choseong tokens) are indexed a second time with a `\x03` marker. At query time every token is also probed as `\x03`-marked; the count (`title_hits`) is a **ranking-only** signal — it never changes `hits` or the JS API. On equal `hits`, documents whose *title* matches outrank body-only matches and false positives (`\x03` tokens live in the 16-bit hi filter, so a fake title signal needs two independent probes to pass: ~0.2% × 0.0015%). This lifted known-item MRR@10 from 0.38 to 0.98+ on a 1,000-document corpus for ~2% extra bundle size.
 
-## Filter: BinaryFuse8
+## Filters: two corpus-global binary fuse filters
 
-Each document gets its own [binary fuse filter](https://arxiv.org/abs/2201.01174) — a static probabilistic set:
+All (token, document) pairs go into two corpus-wide [binary fuse filters](https://arxiv.org/abs/2201.01174) — static probabilistic sets:
 
-- ~9 bits per token (≈13% overhead over the theoretical minimum)
-- Exactly 3 memory probes per lookup
-- ~0.4% false positives (8-bit fingerprints, 1/256)
+- **lo** — regular + `\x01` choseong tokens, 9-bit fingerprints (~0.2% false positives)
+- **hi** — `\x02` prefix + `\x03` title-ranking tokens, 16-bit fingerprints (~0.0015%) — these feed search-as-you-type and ranking, where a false positive is directly user-visible
+- Exactly 3 memory probes per lookup; fingerprints are bit-packed (any width 8–16, self-described by the blob header)
 - Exact membership only: no enumeration, no deletion, no prefix queries
 
-Two independent hash layers:
+Until v1.3 every document had its own 8-bit filter. That wastes space at per-document scale: the fuse size factor is ~1.45× at a few hundred keys versus ~1.15× at corpus scale, plus a 28-byte header per document and per-segment rounding. Merging everything into one global filter (keying each entry as `pairKey(doc_id, token_key)` — the doc id mixed through splitmix64, XORed with the token key) cut the filter section by ~29%, and that saving was reinvested into wider fingerprints: same transfer size, half the false positives, and a near-exact hi tier.
+
+Three independent hash layers:
 
 ```
-token ─ xxhash64 ─► u64 key ─ murmur64(key + seed) ─► 3 positions + 8-bit fingerprint
-        (chaza level)          (filter internal)
+token ─ xxhash64 ─► u64 key ─ ⊕ splitmix64(doc_id) ─► pair key ─ murmur64(key + seed) ─► 3 positions + w-bit fingerprint
+        (chaza level)           (pair level)                      (filter internal)
 ```
 
-Construction and lookup are both pure Zig (ported from the C `fastfilter` reference). Because the generator and runtime share the same code, hash mismatch between build and query time is structurally impossible.
+Construction and lookup are both pure Zig (ported from the C `fastfilter` reference, generalized to packed fingerprint widths). Because the generator and runtime share the same code, hash mismatch between build and query time is structurally impossible.
 
-The filter is the only representation stored — no original text or token list survives into the bundle.
+The filters are the only representation stored — no original text or token list survives into the bundle.
 
 ## Search execution
 
@@ -79,7 +81,7 @@ The filter is the only representation stored — no original text or token list 
 1. Tokenize the query with the same pipeline as indexing
 2. Mark choseong-only tokens with `\x01`; build the `\x02` prefix probe for the last token
 3. Cap at 16 query tokens (see below)
-4. For every document, count how many query tokens hit its filter (`hits`) and how many hit as `\x03` title probes (`title_hits`)
+4. For every document, count how many query tokens hit the lo filter under that document's pair key (`hits`) and how many hit as `\x03` title probes in the hi filter (`title_hits`)
 5. Keep documents with `hits ≥ 1`, sort by `hits` desc, then `title_hits` desc, then document input order
 6. Truncate to `max_results` (0 → 20)
 7. Return a buffer: `[u32 count][(u32 doc_id, u32 hits) × count]`, little-endian
@@ -88,7 +90,7 @@ The loader reads doc ids, then resolves title / url / metadata from the string p
 
 ### Why cap at 16 tokens?
 
-OR semantics means every token gives every document an independent ~0.4% false-positive chance. Expected fake hits per token ≈ N/256 documents. Without a cap, a 255-token query would falsely match ~64% of all documents. 16 tokens keeps the noise floor at ~6% of documents in the worst case while never truncating a realistic query.
+OR semantics means every token gives every document an independent ~0.2% false-positive chance. Expected fake hits per token ≈ N/512 documents. Without a cap, a very long query would falsely match a large fraction of all documents. 16 tokens keeps the noise floor at ~3% of documents in the worst case while never truncating a realistic query.
 
 ## Bundle format
 
@@ -100,12 +102,12 @@ Tail meta (little-endian): magic, version, `wasm_len`, `index_len`. The loader r
 
 Bytes are **appended**, not spliced into the WASM data section, because WASM sections carry LEB128 length headers that would need recomputing for every index size. Consequence: `chaza.bundle` is not a valid WASM module and `WebAssembly.instantiateStreaming` on it fails — always go through `chaza.js`.
 
-The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`) that the runtime reads zero-parse via pointer casts. See [SPEC.md](../SPEC.md) for field-level detail.
+The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`, with filter-data holding the two global blobs as `[lo_len][hi_len][lo][hi]`) that the runtime reads zero-parse via pointer casts. See [SPEC.md](../SPEC.md) for field-level detail.
 
 ## Practical size limits
 
 Three ceilings, in the order they are hit:
 
-1. **False-positive noise.** Fake results per query token ≈ N/256. At ~5,000 documents a single-token query can fill the default 20-result page with statistical noise. This is the real ceiling: **a few thousand documents**.
-2. **Bundle size.** Filters are ~1.1 KB/doc of high-entropy bytes — gzip barely helps. 5,000 docs ≈ 5.5 MB+ download.
+1. **False-positive noise.** Fake results per query token ≈ N/512. At ~10,000 documents a single-token query can fill the default 20-result page with statistical noise. This is the real ceiling: **a few thousand documents** (chaza is designed and verified up to 1,000).
+2. **Bundle size.** Filters are high-entropy bytes — gzip barely helps. Thousands of documents mean multi-megabyte downloads.
 3. **CPU.** Search is a linear scan: docs × tokens × 3 probes. Only matters past ~100k documents, long after 1 and 2.
