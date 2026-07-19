@@ -3,56 +3,22 @@
  *
  * Distributed as a static file. Shared by all sites.
  *
- * The chaza output (chaza.wasm) is a plain valid WASM module: the search
- * index is embedded in it as a data segment, and its location is published
- * through two exported globals (chaza_index_ptr / chaza_index_len). This
- * loader instantiates the module (streaming when possible), reads the
- * globals, and calls set_index(ptr, len) — the index bytes are already in
- * wasm memory, no copy needed.
+ * The chaza output (chaza.wasm) is a self-contained WASM module: the search
+ * index is embedded as data segments, and the runtime self-initializes from
+ * a metadata slot. This loader instantiates the module, reads the meta field
+ * schema once, and delegates all search/index work to the wasm side.
  *
- * Memory management:
- *   alloc(n) may grow wasm.memory.buffer, invalidating previous TypedArray views.
- *   The index lives inside initial memory, so growth never moves or affects it.
- *   Each search() call creates fresh DataView/Uint8Array views for reading results.
+ * Result format (NUL-separated, wasm materializes all strings):
+ *   [u32 count]
+ *   per result:
+ *     [u32 hits]
+ *     title\0 url\0 meta_value_1\0 ... meta_value_N\0
  */
-
-// --- Constants ---
-
-/** Magic number. LE-serialized bytes spell 'C','H','A','Z'. */
-const MAGIC = 0x5a414843;
-/** Index format version. */
-const VERSION = 3;
-/** DocEntryPrefix: title_off(4) + title_len(4) + url_off(4) + url_len(4). */
-const DOC_ENTRY_PREFIX_SIZE = 16;
-/** MetaEntry: off(4) + len(4). */
-const META_ENTRY_SIZE = 8;
 
 const _decoder = new TextDecoder("utf-8");
 const _encoder = new TextEncoder();
 
 // --- Types ---
-
-/** Parsed index header (first 32 bytes of the index section). */
-export interface IndexHeader {
-  magic: number;
-  version: number;
-  filterKind: number;
-  hashK: number;
-  tokenizerKind: number;
-  numDocs: number;
-  numMetaFields: number;
-  metaNamesOff: number;
-  docTableOff: number;
-  stringPoolOff: number;
-  filtersOff: number;
-}
-
-/** Raw document entry data read from the index. */
-interface DocEntryData {
-  title: string;
-  url: string;
-  metaValues: string[];
-}
 
 /** Options for search(). */
 export interface SearchOptions {
@@ -75,170 +41,35 @@ export interface SearchResult {
 
 /** WASM export signatures. */
 interface WasmExports {
-  alloc(n: number): number;
-  set_index(ptr: number, len: number): void;
-  search(
-    queryPtr: number,
-    queryLen: number,
-    maxResults: number,
-  ): number;
+  prepare_query(len: number): number;
+  meta_fields(): number;
+  search(queryLen: number, maxResults: number): number;
   memory: WebAssembly.Memory;
-  /** Index location globals injected by the chaza wasm patcher. */
-  chaza_index_ptr: WebAssembly.Global;
-  chaza_index_len: WebAssembly.Global;
 }
+
+const REQUIRED_FUNCS = ["prepare_query", "meta_fields", "search"] as const;
 
 /** Type guard for WASM exports. */
 function asWasmExports(
   exports: WebAssembly.Exports,
 ): WasmExports {
   const e = exports as Record<string, unknown>;
-  if (typeof e.alloc !== "function") {
-    throw new Error("chaza: wasm export 'alloc' not found");
-  }
-  if (typeof e.set_index !== "function") {
-    throw new Error("chaza: wasm export 'set_index' not found");
-  }
-  if (typeof e.search !== "function") {
-    throw new Error("chaza: wasm export 'search' not found");
+  for (const name of REQUIRED_FUNCS) {
+    if (typeof e[name] !== "function") {
+      throw new Error(`chaza: wasm export '${name}' not found`);
+    }
   }
   if (!(e.memory instanceof WebAssembly.Memory)) {
     throw new Error("chaza: wasm export 'memory' not found");
   }
-  if (
-    !(e.chaza_index_ptr instanceof WebAssembly.Global) ||
-    !(e.chaza_index_len instanceof WebAssembly.Global)
-  ) {
-    throw new Error(
-      "chaza: index globals not found — is this a chaza-built .wasm?",
-    );
-  }
   return e as unknown as WasmExports;
 }
 
-// --- Internal helpers ---
-
-/**
- * Read a little-endian u32 from bytes at the given offset.
- */
-export function readU32LE(
-  bytes: Uint8Array | ArrayBuffer,
-  offset: number,
-): number {
-  const dv =
-    bytes instanceof DataView
-      ? bytes
-      : bytes instanceof ArrayBuffer
-        ? new DataView(bytes)
-        : new DataView(
-          (bytes as Uint8Array).buffer,
-          (bytes as Uint8Array).byteOffset,
-          (bytes as Uint8Array).byteLength,
-        );
-  return dv.getUint32(offset, true);
-}
-
-/**
- * Parse the index header (32 bytes at the start of the index section).
- */
-function parseHeader(dv: DataView): IndexHeader {
-  const magic = dv.getUint32(0, true);
-  if (magic !== MAGIC) {
-    throw new Error(
-      `chaza: invalid index magic 0x${magic.toString(16)} (expected 0x${MAGIC.toString(16)})`,
-    );
-  }
-  const version = dv.getUint8(4);
-  if (version !== VERSION) {
-    throw new Error(
-      `chaza: unsupported index version ${version} (expected ${VERSION})`,
-    );
-  }
-  return {
-    magic,
-    version,
-    filterKind: dv.getUint8(5),
-    hashK: dv.getUint8(6),
-    tokenizerKind: dv.getUint8(7),
-    numDocs: dv.getUint32(8, true),
-    numMetaFields: dv.getUint32(12, true),
-    metaNamesOff: dv.getUint32(16, true),
-    docTableOff: dv.getUint32(20, true),
-    stringPoolOff: dv.getUint32(24, true),
-    filtersOff: dv.getUint32(28, true),
-  };
-}
-
-/**
- * Parse NUL-terminated metadata field names from the meta-names region.
- */
-export function parseMetaNames(
-  indexBytes: Uint8Array,
-  header: IndexHeader,
-): string[] {
-  const names: string[] = [];
-  const { metaNamesOff: regionStart, docTableOff: regionEnd, numMetaFields: numMeta } = header;
-  for (let i = regionStart, count = 0; i < regionEnd && count < numMeta; i++, count++) {
-    const start = i;
-    while (i < regionEnd && indexBytes[i] !== 0) i++;
-    names.push(_decoder.decode(indexBytes.subarray(start, i)));
-  }
-  return names;
-}
-
-/**
- * Read a document entry (title, url, meta values) by doc_id from the index.
- * Returns null if doc_id is out of range.
- */
-export function getDocEntry(
-  dv: DataView,
-  memBytes: Uint8Array,
-  header: IndexHeader,
-  stringPoolBase: number,
-  docId: number,
-): DocEntryData | null {
-  if (docId >= header.numDocs) return null;
-
-  const stride = DOC_ENTRY_PREFIX_SIZE + META_ENTRY_SIZE * header.numMetaFields;
-  const docOff = header.docTableOff + docId * stride;
-
-  // DocEntryPrefix
-  const titleOff = dv.getUint32(docOff, true);
-  const titleLen = dv.getUint32(docOff + 4, true);
-  const urlOff = dv.getUint32(docOff + 8, true);
-  const urlLen = dv.getUint32(docOff + 12, true);
-
-  // MetaEntry[num_meta_fields]
-  const metaValues: string[] = [];
-  const metaStart = docOff + DOC_ENTRY_PREFIX_SIZE;
-  for (let j = 0; j < header.numMetaFields; j++) {
-    const mOff = dv.getUint32(metaStart + j * META_ENTRY_SIZE, true);
-    const mLen = dv.getUint32(metaStart + j * META_ENTRY_SIZE + 4, true);
-    const absOff = stringPoolBase + mOff;
-    metaValues.push(
-      _decoder.decode(memBytes.subarray(absOff, absOff + mLen)),
-    );
-  }
-
-  const titleAbs = stringPoolBase + titleOff;
-  const urlAbs = stringPoolBase + urlOff;
-
-  return {
-    title: _decoder.decode(memBytes.subarray(titleAbs, titleAbs + titleLen)),
-    url: _decoder.decode(memBytes.subarray(urlAbs, urlAbs + urlLen)),
-    metaValues,
-  };
-}
-
-/**
- * Extract a UTF-8 string from a string pool slice.
- */
-export function readStringAt(
-  stringPool: Uint8Array,
-  off: number,
-  len: number,
-): string {
-  return _decoder.decode(stringPool.subarray(off, off + len));
+function eatString(dv: DataView, offset: number): { str: string; next: number } {
+  let pos = offset;
+  while (dv.getUint8(pos) !== 0) pos++;
+  const str = _decoder.decode(new Uint8Array(dv.buffer, offset, pos - offset));
+  return { str, next: pos + 1 };
 }
 
 // --- Chaza class ---
@@ -249,34 +80,32 @@ export function readStringAt(
  */
 export class Chaza {
   private _exports!: WasmExports;
-  private _memory!: WebAssembly.Memory;
-  private _indexPtr!: number;
-  private _header!: IndexHeader;
   private _metaNames!: string[];
-  private _stringPoolBase!: number;
-  /** Reused wasm-side query buffer — the runtime has no free(), so a fresh
-   * alloc per search would leak. Grown geometrically when a query outgrows
-   * it (the outgrown buffer is abandoned, bounding waste at ~2× the largest
-   * query seen). */
-  private _queryPtr = 0;
-  private _queryCap = 0;
 
-  /** Exposed for testing. */
-  get _header_pub(): IndexHeader {
-    return this._header;
+  /** Number of documents in the loaded index. */
+  get documentCount(): number {
+    return this._documentCount;
   }
-  get _metaNames_pub(): string[] {
+  private _documentCount = 0;
+
+  /** Metadata field names declared in the index schema. */
+  get metadataFields(): readonly string[] {
     return this._metaNames;
+  }
+
+  /** Underlying wasm memory (exposed for testing/diagnostics). */
+  get wasmMemory(): WebAssembly.Memory {
+    return this._exports.memory;
   }
 
   /**
    * Load a chaza .wasm file and return a ready-to-search instance.
    *
-   * The index is embedded in the module as a data segment, so instantiation
-   * alone places it in wasm memory. URL/Response inputs use
-   * WebAssembly.instantiateStreaming when available (compile while
-   * downloading), falling back to a buffered instantiate if the server
-   * doesn't serve application/wasm.
+   * The index is embedded in the module as data segments, so instantiation
+   * alone places it in wasm memory and the runtime self-initializes.
+   * URL/Response inputs use WebAssembly.instantiateStreaming when the
+   * Content-Type is application/wasm (compile while downloading), falling
+   * back to a buffered instantiate otherwise.
    *
    * @param input - .wasm URL (string/URL), Response, ArrayBuffer, or Uint8Array.
    * @returns A Chaza instance.
@@ -292,7 +121,7 @@ export class Chaza {
       )) as WebAssembly.WebAssemblyInstantiatedSource;
       instance = result.instance;
     } else {
-      // URL string, URL object, or Response — streaming path
+      // URL string, URL object, or Response — fetch + instantiate
       let resp: Response;
       if (typeof Response !== "undefined" && input instanceof Response) {
         resp = input;
@@ -304,47 +133,42 @@ export class Chaza {
           );
         }
       }
-      if (typeof WebAssembly.instantiateStreaming === "function") {
-        try {
-          const result = await WebAssembly.instantiateStreaming(resp.clone());
-          instance = result.instance;
-        } catch {
-          // Wrong MIME type (not application/wasm) — buffered fallback
-          const ab = await resp.arrayBuffer();
-          const result = await WebAssembly.instantiate(ab);
-          instance = result.instance;
-        }
+
+      const contentType = resp.headers.get("content-type")?.split(";")[0].trim();
+
+      if (
+        typeof WebAssembly.instantiateStreaming === "function" &&
+        contentType === "application/wasm"
+      ) {
+        const result = await WebAssembly.instantiateStreaming(resp);
+        instance = result.instance;
       } else {
-        const ab = await resp.arrayBuffer();
-        const result = await WebAssembly.instantiate(ab);
+        const bytes = await resp.arrayBuffer();
+        const result = await WebAssembly.instantiate(bytes);
         instance = result.instance;
       }
     }
 
     const exports = asWasmExports(instance.exports);
 
-    // Index location comes from the patched-in exported globals; the bytes
-    // are already in memory via the data segment.
-    const indexPtr = (exports.chaza_index_ptr.value as number) >>> 0;
-    const indexLen = (exports.chaza_index_len.value as number) >>> 0;
-
-    // Register the index with the runtime
-    exports.set_index(indexPtr, indexLen);
-
-    // Cache header and meta names from the stable memory
+    // Read index info once: [u32 num_docs][u32 num_meta][name1\0 name2\0 ...]
     const mem = exports.memory;
-    const dv = new DataView(mem.buffer, indexPtr);
-    const indexRelBytes = new Uint8Array(mem.buffer, indexPtr);
-    const header = parseHeader(dv);
-    const metaNames = parseMetaNames(indexRelBytes, header);
+    const infoPtr = exports.meta_fields();
+    const infoDv = new DataView(mem.buffer);
+    const numDocs = infoDv.getUint32(infoPtr, true);
+    const numMeta = infoDv.getUint32(infoPtr + 4, true);
+    const metaNames: string[] = [];
+    let off = infoPtr + 8;
+    for (let i = 0; i < numMeta; i++) {
+      const eaten = eatString(infoDv, off);
+      metaNames.push(eaten.str);
+      off = eaten.next;
+    }
 
     const chaza = new Chaza();
     chaza._exports = exports;
-    chaza._memory = mem;
-    chaza._indexPtr = indexPtr;
-    chaza._header = header;
     chaza._metaNames = metaNames;
-    chaza._stringPoolBase = indexPtr + header.stringPoolOff;
+    chaza._documentCount = numDocs;
     return chaza;
   }
 
@@ -366,61 +190,46 @@ export class Chaza {
    */
   search(query: string, opts: SearchOptions = {}): SearchResult[] {
     const maxResults = opts.maxResults ?? 0;
-
     const exports = this._exports;
 
-    // Write query UTF-8 bytes into the reused wasm-side buffer
+    // Encode query into the runtime-owned query buffer
     const queryBytes = _encoder.encode(query);
-    if (queryBytes.length > this._queryCap) {
-      const newCap = Math.max(queryBytes.length, this._queryCap * 2, 256);
-      this._queryPtr = exports.alloc(newCap);
-      this._queryCap = newCap;
-    }
-    const qPtr = this._queryPtr;
-
-    // alloc may have grown memory — fresh view
+    const qPtr = exports.prepare_query(queryBytes.length);
     const qView = new Uint8Array(
-      this._memory.buffer,
+      exports.memory.buffer,
       qPtr,
       queryBytes.length,
     );
     qView.set(queryBytes);
 
-    // Call search
-    const resultPtr = exports.search(qPtr, queryBytes.length, maxResults);
+    // Call search — wasm materializes all strings into the result buffer
+    const resultPtr = exports.search(queryBytes.length, maxResults);
 
-    // Read results — fresh views (alloc may have grown memory)
-    const indexDv = new DataView(this._memory.buffer, this._indexPtr);
-    const memBytes = new Uint8Array(this._memory.buffer);
-    const resultDv = new DataView(this._memory.buffer);
+    // Parse result buffer: [u32 count][per result: u32 hits, title\0, url\0, meta\0 × N]
+    const mem = exports.memory;
+    const dv = new DataView(mem.buffer);
+    const count = dv.getUint32(resultPtr, true);
 
-    // Result buffer: [u32 count][(u32 doc_id, u32 hits) × count], little-endian
-    const count = resultDv.getUint32(resultPtr, true);
+    let off = resultPtr + 4;
     const results: SearchResult[] = [];
     for (let i = 0; i < count; i++) {
-      const docId = resultDv.getUint32(resultPtr + 4 + i * 8, true);
-      const hits = resultDv.getUint32(resultPtr + 8 + i * 8, true);
-      const entry = getDocEntry(
-        indexDv,
-        memBytes,
-        this._header,
-        this._stringPoolBase,
-        docId,
-      );
-      if (entry === null) continue;
+      const hits = dv.getUint32(off, true);
+      off += 4;
 
-      // Build meta object: { field_name: value }
+      // Read NUL-terminated strings: title, url, meta values.
+      const title = eatString(dv, off);
+      off = title.next;
+      const url = eatString(dv, off);
+      off = url.next;
+
       const meta: Record<string, string> = {};
-      for (let j = 0; j < this._metaNames.length; j++) {
-        meta[this._metaNames[j]] = entry.metaValues[j] ?? "";
+      for (const metaName of this._metaNames) {
+        const v = eatString(dv, off);
+        meta[metaName] = v.str;
+        off = v.next;
       }
 
-      results.push({
-        title: entry.title,
-        url: entry.url,
-        meta,
-        hits,
-      });
+      results.push({ title: title.str, url: url.str, meta, hits });
     }
 
     return results;

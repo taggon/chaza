@@ -1,41 +1,47 @@
 //! chaza wasm patcher — embeds index bytes directly into the runtime wasm
-//! binary as an active data segment.
+//! binary as active data segments.
 //!
 //! embed() rewrites the module:
 //!   1. Memory section: min pages extended so the index region [old_end,
 //!      old_end + index_len) is inside initial memory (index sits at the old
 //!      memory end, page-aligned).
-//!   2. Global section: two immutable i32 globals appended holding the index
-//!      address and length.
-//!   3. Export section: the globals exported as "chaza_index_ptr" /
-//!      "chaza_index_len".
-//!   4. Data section: one active segment (memory 0, i32.const index_ptr)
-//!      carrying the index bytes.
-//!   5. Data count section (if present): count incremented.
+//!   2. Data section: two active segments added —
+//!        a) metadata segment: 8 bytes (ptr LE, len LE) written to the
+//!           runtime's g_embedded_index slot, whose address the patcher
+//!           discovers by scanning for the sentinel pattern (0xFEEDFACE × 2)
+//!           in the existing data section.
+//!        b) index segment: the index bytes at the old memory end.
+//!   3. Data count section (if present): count incremented by 2.
 //!
-//! The output is a self-contained valid .wasm file: the JS loader
-//! instantiates it, reads the two exported globals, and calls
-//! set_index(ptr, len) — no alloc/copy of the index at load time.
+//! No globals or exports are injected. The runtime initializes
+//! g_embedded_index to {SENTINEL, SENTINEL}; the patcher's metadata segment
+//! overwrites it with the real (ptr, len) at instantiation time.
 //!
 //! extractIndex() is the read-side counterpart (tests·verification): it
-//! locates the exported globals and returns an aligned copy of the matching
-//! data segment payload.
+//! locates the sentinel, reads the non-sentinel metadata segment at the
+//! same address, and returns an aligned copy of the index segment.
 //!
 //! Scope: this is a chaza-runtime-profile patcher, not a general wasm
 //! rewriter. Inputs outside the profile are rejected up front rather than
 //! silently mis-patched:
 //!   - imported memory / tag imports / typed (GC) references →
 //!     error.UnsupportedWasmFeature / UnsupportedMemory
-//!   - already-patched modules or export-name collisions →
-//!     error.AlreadyPatched / ExportNameConflict (wasm export names must be
-//!     unique; re-embedding would emit invalid wasm)
-//!   - const expressions are single-instruction only (i32/i64/f32/f64.const,
-//!     global.get) — extended const expressions are out of profile
+//!   - already-patched modules (non-sentinel segment at slot address) →
+//!     error.AlreadyPatched
+//!   - sentinel absent or appears at multiple addresses →
+//!     error.MetaSlotNotFound / MultipleMetaSlots
 
 const std = @import("std");
 
-pub const PTR_EXPORT_NAME = "chaza_index_ptr";
-pub const LEN_EXPORT_NAME = "chaza_index_len";
+const META_SENTINEL: u32 = 0xFEEDFACE;
+
+/// 8-byte LE sentinel pattern: two identical 0xFEEDFACE u32s.
+const sentinel_pattern: [8]u8 = blk: {
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], META_SENTINEL, .little);
+    std.mem.writeInt(u32, buf[4..8], META_SENTINEL, .little);
+    break :blk buf;
+};
 
 const WASM_PAGE_SIZE: usize = 65536;
 const WASM_MAGIC = [4]u8{ 0x00, 0x61, 0x73, 0x6D };
@@ -58,7 +64,7 @@ const SEC_DATACOUNT: u8 = 12;
 const SEC_TAG: u8 = 13;
 
 // Export kinds
-const KIND_GLOBAL: u8 = 0x03;
+const KIND_MEM: u8 = 0x02;
 
 // Opcodes / types used in const expressions
 const OP_I32_CONST: u8 = 0x41;
@@ -67,13 +73,22 @@ const OP_F32_CONST: u8 = 0x43;
 const OP_F64_CONST: u8 = 0x44;
 const OP_GLOBAL_GET: u8 = 0x23;
 const OP_END: u8 = 0x0B;
-const VALTYPE_I32: u8 = 0x7F;
 
-/// Minimal valid module for tests: memory (min 1 page) + "memory" export.
+/// Minimal valid module for tests: memory (min 1 page) + "memory" export +
+/// a sentinel data segment at address 0 (the metadata slot the patcher
+/// discovers and overwrites).
 pub const test_minimal_wasm = [_]u8{
     0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // header
-    0x05, 0x03, 0x01, 0x00, 0x01, // memory section: 1 memory, flags 0, min 1
-    0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, // export "memory"
+    // memory section: 1 memory, flags 0, min 1
+    0x05, 0x03, 0x01, 0x00, 0x01,
+    // export section: "memory" mem 0
+    0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    // data section: 1 segment at addr 0, 8 bytes sentinel (0xFEEDFACE × 2 LE)
+    0x0B, 0x0E, 0x01,
+    0x00, // flags: active, memory 0
+    0x41, 0x00, 0x0B, // i32.const 0, end
+    0x08, // 8 bytes
+    0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
 };
 
 pub const PatchError = error{
@@ -84,8 +99,8 @@ pub const PatchError = error{
     UnsupportedConstExpr,
     IndexTooLarge,
     AlreadyPatched,
-    ExportNameConflict,
-    MissingChazaExports,
+    MetaSlotNotFound,
+    MultipleMetaSlots,
     SegmentNotFound,
     OutOfMemory,
 };
@@ -255,11 +270,12 @@ fn checkValType(payload: []const u8, off: *usize) PatchError!u8 {
 const ImportCounts = struct {
     globals: u32 = 0,
     memories: u32 = 0,
+    funcs: u32 = 0,
 };
 
-/// Count imported globals/memories (they precede defined entries in their
-/// index spaces). Rejects tag imports and typed-reference tables (out of
-/// profile).
+/// Count imported globals/memories/funcs (they precede defined entries in
+/// their index spaces). Rejects tag imports and typed-reference tables (out
+/// of profile).
 fn parseImports(payload: []const u8) PatchError!ImportCounts {
     var off: usize = 0;
     var counts: ImportCounts = .{};
@@ -275,7 +291,10 @@ fn parseImports(payload: []const u8) PatchError!ImportCounts {
         const kind = payload[off];
         off += 1;
         switch (kind) {
-            0x00 => _ = try readLebU32(payload, &off), // func: typeidx
+            0x00 => {
+                _ = try readLebU32(payload, &off); // func: typeidx
+                counts.funcs += 1;
+            },
             0x01 => { // table: reftype + limits
                 const rt = try checkValType(payload, &off);
                 if (rt != 0x70 and rt != 0x6F) return error.InvalidWasm;
@@ -346,41 +365,53 @@ fn readSimpleConstExpr(payload: []const u8, off: *usize) PatchError!?i32 {
     return value;
 }
 
-/// What the export section already says about the two chaza export names.
-const ExportScan = struct {
-    ptr_found: bool = false,
-    ptr_kind: u8 = 0,
-    ptr_idx: u32 = 0,
-    len_found: bool = false,
-    len_kind: u8 = 0,
-    len_idx: u32 = 0,
-};
+// ── Sentinel scanner ──
 
-fn scanExports(payload: []const u8) PatchError!ExportScan {
-    var scan: ExportScan = .{};
-    var off: usize = 0;
-    const count = try readLebU32(payload, &off);
-    for (0..count) |_| {
-        const name_len = try readLebU32(payload, &off);
-        if (name_len > payload.len - off) return error.InvalidWasm;
-        const name = payload[off..][0..name_len];
-        off += name_len;
-        if (off >= payload.len) return error.InvalidWasm;
-        const kind = payload[off];
-        off += 1;
-        const idx = try readLebU32(payload, &off);
-        if (std.mem.eql(u8, name, PTR_EXPORT_NAME)) {
-            scan.ptr_found = true;
-            scan.ptr_kind = kind;
-            scan.ptr_idx = idx;
-        } else if (std.mem.eql(u8, name, LEN_EXPORT_NAME)) {
-            scan.len_found = true;
-            scan.len_kind = kind;
-            scan.len_idx = idx;
+/// Scan data segments for the 8-byte sentinel pattern. Returns the memory
+/// address of the metadata slot. Errors if the pattern is absent or appears
+/// at multiple addresses.
+fn discoverMetaSlotAddr(sections: []const Section) PatchError!u32 {
+    var found: ?u32 = null;
+    for (sections) |s| {
+        if (s.id != SEC_DATA) continue;
+        var off: usize = 0;
+        const count = try readLebU32(s.payload, &off);
+        for (0..count) |_| {
+            const flags = try readLebU32(s.payload, &off);
+            var memidx: u32 = 0;
+            var seg_offset: ?i32 = null;
+            switch (flags) {
+                0 => seg_offset = try readSimpleConstExpr(s.payload, &off),
+                1 => {}, // passive
+                2 => {
+                    memidx = try readLebU32(s.payload, &off);
+                    seg_offset = try readSimpleConstExpr(s.payload, &off);
+                },
+                else => return error.InvalidWasm,
+            }
+            const size = try readLebU32(s.payload, &off);
+            if (size > s.payload.len - off) return error.InvalidWasm;
+            const data = s.payload[off..][0..size];
+            off += size;
+
+            if (memidx != 0 or seg_offset == null) continue;
+            if (seg_offset.? < 0) continue;
+            const base: u32 = @intCast(seg_offset.?);
+
+            var i: usize = 0;
+            while (i + 8 <= data.len) : (i += 1) {
+                if (std.mem.eql(u8, data[i..][0..8], &sentinel_pattern)) {
+                    const addr = base + @as(u32, @intCast(i));
+                    if (found) |prev| {
+                        if (prev != addr) return error.MultipleMetaSlots;
+                    } else {
+                        found = addr;
+                    }
+                }
+            }
         }
     }
-    if (off != payload.len) return error.InvalidWasm;
-    return scan;
+    return found orelse error.MetaSlotNotFound;
 }
 
 // ── embed ──
@@ -395,25 +426,13 @@ pub fn embed(
     var sections = try parseSections(allocator, wasm_bytes);
     defer sections.deinit(allocator);
 
-    // Locate memory limits, import counts, defined globals, existing exports
+    // Locate memory limits and import counts
     var mem: ?MemLimits = null;
     var imports: ImportCounts = .{};
-    var defined_globals: u32 = 0;
     for (sections.items) |s| {
         switch (s.id) {
             SEC_MEMORY => mem = try parseMemorySection(s.payload),
             SEC_IMPORT => imports = try parseImports(s.payload),
-            SEC_GLOBAL => {
-                var off: usize = 0;
-                defined_globals = try readLebU32(s.payload, &off);
-            },
-            SEC_EXPORT => {
-                // Wasm export names must be unique — refuse rather than emit
-                // an invalid module. Both names present = already patched.
-                const scan = try scanExports(s.payload);
-                if (scan.ptr_found and scan.len_found) return error.AlreadyPatched;
-                if (scan.ptr_found or scan.len_found) return error.ExportNameConflict;
-            },
             else => {},
         }
     }
@@ -421,6 +440,9 @@ pub fn embed(
     // would be a different memory than the one whose limits we extend.
     if (imports.memories != 0) return error.UnsupportedMemory;
     const limits = mem orelse return error.NoMemorySection;
+
+    // Discover the metadata slot address from chaza_index_meta
+    const meta_slot_addr = try discoverMetaSlotAddr(sections.items);
 
     // Index region: starts at the old memory end (page-aligned)
     const index_ptr_u: u64 = @as(u64, limits.min) * WASM_PAGE_SIZE;
@@ -431,8 +453,10 @@ pub fn embed(
     const index_ptr: i32 = @intCast(index_ptr_u);
     const index_len: i32 = @intCast(index_bytes.len);
 
-    const ptr_global_idx = std.math.add(u32, imports.globals, defined_globals) catch return error.InvalidWasm;
-    const len_global_idx = std.math.add(u32, ptr_global_idx, 1) catch return error.InvalidWasm;
+    // Metadata payload: [index_ptr LE u32][index_len LE u32] = 8 bytes
+    var meta_data: [8]u8 = undefined;
+    std.mem.writeInt(u32, meta_data[0..4], @intCast(index_ptr), .little);
+    std.mem.writeInt(u32, meta_data[4..8], @intCast(index_len), .little);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -442,26 +466,9 @@ pub fn embed(
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(allocator);
 
-    const rank_global = sectionRank(SEC_GLOBAL).?;
-    const rank_export = sectionRank(SEC_EXPORT).?;
-
-    var global_done = false;
-    var export_done = false;
     var data_done = false;
 
     for (sections.items) |s| {
-        if (s.id != SEC_CUSTOM) {
-            const r = sectionRank(s.id).?; // validated in parseSections
-            // Insert missing sections at their spec-mandated position
-            if (!global_done and s.id != SEC_GLOBAL and r > rank_global) {
-                try emitNewGlobalSection(allocator, &out, &scratch, index_ptr, index_len);
-                global_done = true;
-            }
-            if (!export_done and s.id != SEC_EXPORT and r > rank_export) {
-                try emitNewExportSection(allocator, &out, &scratch, ptr_global_idx, len_global_idx);
-                export_done = true;
-            }
-        }
         switch (s.id) {
             SEC_MEMORY => {
                 scratch.clearRetainingCapacity();
@@ -473,35 +480,11 @@ pub fn embed(
                 }
                 try emitSection(allocator, &out, SEC_MEMORY, scratch.items);
             },
-            SEC_GLOBAL => {
-                var off: usize = 0;
-                const count = try readLebU32(s.payload, &off);
-                const new_count = std.math.add(u32, count, 2) catch return error.InvalidWasm;
-                scratch.clearRetainingCapacity();
-                try writeLebU32(&scratch, allocator, new_count);
-                try scratch.appendSlice(allocator, s.payload[off..]);
-                try appendI32Global(&scratch, allocator, index_ptr);
-                try appendI32Global(&scratch, allocator, index_len);
-                try emitSection(allocator, &out, SEC_GLOBAL, scratch.items);
-                global_done = true;
-            },
-            SEC_EXPORT => {
-                var off: usize = 0;
-                const count = try readLebU32(s.payload, &off);
-                const new_count = std.math.add(u32, count, 2) catch return error.InvalidWasm;
-                scratch.clearRetainingCapacity();
-                try writeLebU32(&scratch, allocator, new_count);
-                try scratch.appendSlice(allocator, s.payload[off..]);
-                try appendGlobalExport(&scratch, allocator, PTR_EXPORT_NAME, ptr_global_idx);
-                try appendGlobalExport(&scratch, allocator, LEN_EXPORT_NAME, len_global_idx);
-                try emitSection(allocator, &out, SEC_EXPORT, scratch.items);
-                export_done = true;
-            },
             SEC_DATACOUNT => {
                 var off: usize = 0;
                 const count = try readLebU32(s.payload, &off);
                 if (off != s.payload.len) return error.InvalidWasm;
-                const new_count = std.math.add(u32, count, 1) catch return error.InvalidWasm;
+                const new_count = std.math.add(u32, count, 2) catch return error.InvalidWasm;
                 scratch.clearRetainingCapacity();
                 try writeLebU32(&scratch, allocator, new_count);
                 try emitSection(allocator, &out, SEC_DATACOUNT, scratch.items);
@@ -509,11 +492,17 @@ pub fn embed(
             SEC_DATA => {
                 var off: usize = 0;
                 const count = try readLebU32(s.payload, &off);
-                const new_count = std.math.add(u32, count, 1) catch return error.InvalidWasm;
+                // Reject already-patched modules: a segment already targeting
+                // the metadata slot address means embed() ran before.
+                try checkAlreadyPatched(s.payload, off, count, meta_slot_addr);
+                const new_count = std.math.add(u32, count, 2) catch return error.InvalidWasm;
                 scratch.clearRetainingCapacity();
                 try writeLebU32(&scratch, allocator, new_count);
                 try scratch.appendSlice(allocator, s.payload[off..]);
-                try appendIndexSegment(&scratch, allocator, index_ptr, index_bytes);
+                // metadata segment (8 bytes at the metadata slot address)
+                try appendActiveSegment(&scratch, allocator, @intCast(meta_slot_addr), &meta_data);
+                // index segment (index bytes at the old memory end)
+                try appendActiveSegment(&scratch, allocator, index_ptr, index_bytes);
                 try emitSection(allocator, &out, SEC_DATA, scratch.items);
                 data_done = true;
             },
@@ -521,18 +510,51 @@ pub fn embed(
         }
     }
 
-    // Sections absent from the module → append at the end (relative order
-    // global < export < data is preserved by this emission order).
-    if (!global_done) try emitNewGlobalSection(allocator, &out, &scratch, index_ptr, index_len);
-    if (!export_done) try emitNewExportSection(allocator, &out, &scratch, ptr_global_idx, len_global_idx);
+    // No data section in the original module → create one from scratch
     if (!data_done) {
         scratch.clearRetainingCapacity();
-        try writeLebU32(&scratch, allocator, 1);
-        try appendIndexSegment(&scratch, allocator, index_ptr, index_bytes);
+        try writeLebU32(&scratch, allocator, 2);
+        try appendActiveSegment(&scratch, allocator, @intCast(meta_slot_addr), &meta_data);
+        try appendActiveSegment(&scratch, allocator, index_ptr, index_bytes);
         try emitSection(allocator, &out, SEC_DATA, scratch.items);
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// Scan existing data segments for a non-sentinel 8-byte segment at the
+/// metadata slot address → already patched.
+fn checkAlreadyPatched(
+    data_payload: []const u8,
+    initial_off: usize,
+    count: u32,
+    meta_slot_addr: u32,
+) PatchError!void {
+    var off = initial_off;
+    _ = count;
+    while (off < data_payload.len) {
+        const flags = try readLebU32(data_payload, &off);
+        var memidx: u32 = 0;
+        var seg_offset: ?i32 = null;
+        switch (flags) {
+            0 => seg_offset = try readSimpleConstExpr(data_payload, &off),
+            1 => {}, // passive
+            2 => {
+                memidx = try readLebU32(data_payload, &off);
+                seg_offset = try readSimpleConstExpr(data_payload, &off);
+            },
+            else => return error.InvalidWasm,
+        }
+        const size = try readLebU32(data_payload, &off);
+        if (size > data_payload.len - off) return error.InvalidWasm;
+        const bytes = data_payload[off..][0..size];
+        off += size;
+        if (memidx == 0 and size == 8) {
+            if (seg_offset) |so| if (so >= 0 and @as(u32, @intCast(so)) == meta_slot_addr) {
+                if (!std.mem.eql(u8, bytes, &sentinel_pattern)) return error.AlreadyPatched;
+            };
+        }
+    }
 }
 
 fn emitSection(allocator: std.mem.Allocator, out: *std.ArrayList(u8), id: u8, payload: []const u8) !void {
@@ -541,58 +563,14 @@ fn emitSection(allocator: std.mem.Allocator, out: *std.ArrayList(u8), id: u8, pa
     try out.appendSlice(allocator, payload);
 }
 
-/// Immutable i32 global with an i32.const init.
-fn appendI32Global(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i32) !void {
-    try list.append(allocator, VALTYPE_I32);
-    try list.append(allocator, 0x00); // const
-    try list.append(allocator, OP_I32_CONST);
-    try writeSlebI32(list, allocator, value);
-    try list.append(allocator, OP_END);
-}
-
-fn appendGlobalExport(list: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, idx: u32) !void {
-    try writeLebU32(list, allocator, @intCast(name.len));
-    try list.appendSlice(allocator, name);
-    try list.append(allocator, KIND_GLOBAL);
-    try writeLebU32(list, allocator, idx);
-}
-
-/// Active data segment (memory 0) at offset index_ptr.
-fn appendIndexSegment(list: *std.ArrayList(u8), allocator: std.mem.Allocator, index_ptr: i32, index_bytes: []const u8) !void {
+/// Active data segment (memory 0) at the given offset.
+fn appendActiveSegment(list: *std.ArrayList(u8), allocator: std.mem.Allocator, offset: i32, data: []const u8) !void {
     try list.append(allocator, 0x00); // flags: active, memory 0
     try list.append(allocator, OP_I32_CONST);
-    try writeSlebI32(list, allocator, index_ptr);
+    try writeSlebI32(list, allocator, offset);
     try list.append(allocator, OP_END);
-    try writeLebU32(list, allocator, @intCast(index_bytes.len));
-    try list.appendSlice(allocator, index_bytes);
-}
-
-fn emitNewGlobalSection(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    scratch: *std.ArrayList(u8),
-    index_ptr: i32,
-    index_len: i32,
-) !void {
-    scratch.clearRetainingCapacity();
-    try writeLebU32(scratch, allocator, 2);
-    try appendI32Global(scratch, allocator, index_ptr);
-    try appendI32Global(scratch, allocator, index_len);
-    try emitSection(allocator, out, SEC_GLOBAL, scratch.items);
-}
-
-fn emitNewExportSection(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
-    scratch: *std.ArrayList(u8),
-    ptr_idx: u32,
-    len_idx: u32,
-) !void {
-    scratch.clearRetainingCapacity();
-    try writeLebU32(scratch, allocator, 2);
-    try appendGlobalExport(scratch, allocator, PTR_EXPORT_NAME, ptr_idx);
-    try appendGlobalExport(scratch, allocator, LEN_EXPORT_NAME, len_idx);
-    try emitSection(allocator, out, SEC_EXPORT, scratch.items);
+    try writeLebU32(list, allocator, @intCast(data.len));
+    try list.appendSlice(allocator, data);
 }
 
 // ── extract ──
@@ -602,8 +580,10 @@ pub const IndexLocation = struct {
     len: u32,
 };
 
-/// Read the chaza_index_ptr / chaza_index_len exported global values.
-/// The exports must be immutable i32 globals with i32.const initializers.
+/// Read the metadata segment from the data section and return the embedded
+/// index (ptr, len). The metadata slot address is discovered by scanning
+/// for the sentinel pattern; the real values come from the non-sentinel
+/// segment at the same address.
 pub fn indexLocation(wasm_bytes: []const u8) PatchError!IndexLocation {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -612,53 +592,42 @@ pub fn indexLocation(wasm_bytes: []const u8) PatchError!IndexLocation {
     var sections = try parseSections(a, wasm_bytes);
     defer sections.deinit(a);
 
-    var import_payload: ?[]const u8 = null;
-    var global_payload: ?[]const u8 = null;
-    var export_payload: ?[]const u8 = null;
+    const meta_slot_addr = try discoverMetaSlotAddr(sections.items);
+
     for (sections.items) |s| {
-        switch (s.id) {
-            SEC_IMPORT => import_payload = s.payload,
-            SEC_GLOBAL => global_payload = s.payload,
-            SEC_EXPORT => export_payload = s.payload,
-            else => {},
+        if (s.id != SEC_DATA) continue;
+        var off: usize = 0;
+        const count = try readLebU32(s.payload, &off);
+        for (0..count) |_| {
+            const flags = try readLebU32(s.payload, &off);
+            var memidx: u32 = 0;
+            var seg_offset: ?i32 = null;
+            switch (flags) {
+                0 => seg_offset = try readSimpleConstExpr(s.payload, &off),
+                1 => {}, // passive
+                2 => {
+                    memidx = try readLebU32(s.payload, &off);
+                    seg_offset = try readSimpleConstExpr(s.payload, &off);
+                },
+                else => return error.InvalidWasm,
+            }
+            const size = try readLebU32(s.payload, &off);
+            if (size > s.payload.len - off) return error.InvalidWasm;
+            const bytes = s.payload[off..][0..size];
+            off += size;
+            // The metadata segment: 8 bytes at the slot address, NOT the sentinel
+            if (memidx == 0 and size == 8) {
+                if (seg_offset) |so| if (so >= 0 and @as(u32, @intCast(so)) == meta_slot_addr) {
+                    if (!std.mem.eql(u8, bytes, &sentinel_pattern)) {
+                        const ptr = std.mem.readInt(u32, bytes[0..4], .little);
+                        const len = std.mem.readInt(u32, bytes[4..8], .little);
+                        return .{ .ptr = ptr, .len = len };
+                    }
+                };
+            }
         }
     }
-
-    const scan = try scanExports(export_payload orelse return error.MissingChazaExports);
-    if (!scan.ptr_found or !scan.len_found) return error.MissingChazaExports;
-    if (scan.ptr_kind != KIND_GLOBAL or scan.len_kind != KIND_GLOBAL) return error.MissingChazaExports;
-    const pg = scan.ptr_idx;
-    const lg = scan.len_idx;
-
-    const imported = if (import_payload) |p| (try parseImports(p)).globals else 0;
-    if (pg < imported or lg < imported) return error.MissingChazaExports;
-
-    // Walk defined globals to the wanted indices
-    const payload = global_payload orelse return error.MissingChazaExports;
-    var off: usize = 0;
-    const count = try readLebU32(payload, &off);
-    var ptr_val: ?i32 = null;
-    var len_val: ?i32 = null;
-    for (0..count) |i| {
-        const valtype = try checkValType(payload, &off);
-        if (off >= payload.len) return error.InvalidWasm;
-        const mutability = payload[off];
-        off += 1;
-        if (mutability > 1) return error.InvalidWasm;
-        const value = try readSimpleConstExpr(payload, &off);
-        const gidx = imported + @as(u32, @intCast(i));
-        if (gidx == pg or gidx == lg) {
-            // Chaza index globals must be immutable i32 constants
-            if (valtype != VALTYPE_I32 or mutability != 0) return error.MissingChazaExports;
-            const v = value orelse return error.UnsupportedConstExpr;
-            if (gidx == pg) ptr_val = v;
-            if (gidx == lg) len_val = v;
-        }
-    }
-    const p = ptr_val orelse return error.MissingChazaExports;
-    const l = len_val orelse return error.MissingChazaExports;
-    if (p < 0 or l < 0) return error.InvalidWasm;
-    return .{ .ptr = @intCast(p), .len = @intCast(l) };
+    return error.SegmentNotFound;
 }
 
 /// Return a copy of the embedded index bytes, 4-byte aligned so it can be
@@ -754,31 +723,39 @@ test "embed: memory min extended to cover the index" {
     try std.testing.expectEqualSlices(u8, index, extracted);
 }
 
-test "embed on module with existing global/export/data/datacount sections" {
+test "embed on module with existing data/datacount sections" {
     const allocator = std.testing.allocator;
-    // Synthetic module: memory(min 2, max 2) + 1 mutable global + export
-    // "memory" + datacount(1) + data(1 active segment at 0)
+    // Module: memory + "memory" export + datacount(1) + sentinel at addr 0 +
+    // existing data segment at addr 1024. The metadata slot is at address 0
+    // (sentinel); the existing segment at 1024 must not collide.
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        // memory: 1 memory, flags 1 (max), min 2, max 2
-        0x05, 0x04, 0x01, 0x01, 0x02, 0x02,
-        // global: 1 global, i32 mut, i32.const 42
-        0x06, 0x06, 0x01, 0x7F, 0x01, 0x41, 0x2A, 0x0B,
-        // export: "memory" mem 0
-        0x07, 0x0A, 0x01, 0x06, 'm',  'e',  'm',  'o',
-        'r',  'y',  0x02, 0x00,
-        // datacount: 1
-        0x0C, 0x01, 0x01,
-        // data: 1 segment, active, i32.const 0, 3 bytes
-        0x0B, 0x09, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x03,
+        // memory section: min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export section: "memory" mem 0
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // datacount: 2 (matching the 2 data segments below)
+        0x0C, 0x01, 0x02,
+        // data: 2 segments
+        0x0B, 0x17, 0x02,
+        // segment 0: sentinel at addr 0 (8 bytes)
+        0x00, // flags: active, memory 0
+        0x41, 0x00, 0x0B, // i32.const 0, end
+        0x08, // 8 bytes
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
+        // segment 1: existing data at addr 1024 (3 bytes)
+        0x00,
+        0x41, 0x80, 0x08, 0x0B, // i32.const 1024, end
+        0x03, // 3 bytes
         0xAA, 0xBB, 0xCC,
     };
+
     const index = [_]u8{ 9, 8, 7, 6 };
     const patched = try embed(allocator, &module, &index);
     defer allocator.free(patched);
 
     const loc = try indexLocation(patched);
-    try std.testing.expectEqual(@as(u32, 2 * WASM_PAGE_SIZE), loc.ptr);
+    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
     try std.testing.expectEqual(@as(u32, 4), loc.len);
 
     const extracted = try extractIndex(allocator, patched);
@@ -790,27 +767,16 @@ test "embed on module with existing global/export/data/datacount sections" {
     for (sections.items) |s| {
         switch (s.id) {
             SEC_MEMORY => {
-                // min 2 + 1 page for the index; max raised alongside
                 const limits = try parseMemorySection(s.payload);
-                try std.testing.expectEqual(@as(u32, 3), limits.min);
-                try std.testing.expect(limits.has_max);
-                try std.testing.expectEqual(@as(u32, 3), limits.max);
-            },
-            SEC_GLOBAL => {
-                var off: usize = 0;
-                try std.testing.expectEqual(@as(u32, 3), try readLebU32(s.payload, &off));
-            },
-            SEC_EXPORT => {
-                var off: usize = 0;
-                try std.testing.expectEqual(@as(u32, 3), try readLebU32(s.payload, &off));
+                try std.testing.expectEqual(@as(u32, 2), limits.min);
             },
             SEC_DATACOUNT => {
                 var off: usize = 0;
-                try std.testing.expectEqual(@as(u32, 2), try readLebU32(s.payload, &off));
+                try std.testing.expectEqual(@as(u32, 4), try readLebU32(s.payload, &off));
             },
             SEC_DATA => {
                 var off: usize = 0;
-                try std.testing.expectEqual(@as(u32, 2), try readLebU32(s.payload, &off));
+                try std.testing.expectEqual(@as(u32, 4), try readLebU32(s.payload, &off));
             },
             else => {},
         }
@@ -834,69 +800,50 @@ test "embed: section order preserved (rank strictly increasing)" {
     }
 }
 
-test "embed: tag section keeps its place before the inserted global section" {
+test "embed: no global or export sections added" {
     const allocator = std.testing.allocator;
-    // memory + tag(empty) + export "memory": global/export insertion must
-    // not land between memory and tag (tag binary-orders before global).
-    const module = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        // memory: 1 memory, flags 0, min 1
-        0x05, 0x03, 0x01, 0x00, 0x01,
-        // tag section: 0 tags
-        0x0D, 0x01, 0x00,
-        // export: "memory" mem 0
-        0x07, 0x0A, 0x01, 0x06, 'm',  'e',  'm',  'o',
-        'r',  'y',  0x02, 0x00,
-    };
-    const index = [_]u8{ 1, 2, 3 };
-    const patched = try embed(allocator, &module, &index);
+    const index = [_]u8{ 1, 2, 3, 4 };
+    const patched = try embed(allocator, &test_minimal_wasm, &index);
     defer allocator.free(patched);
 
-    // parseSections validates strict binary order — enough on its own, but
-    // assert the expected sequence explicitly.
     var sections = try parseSections(allocator, patched);
     defer sections.deinit(allocator);
-    var ids: std.ArrayList(u8) = .empty;
-    defer ids.deinit(allocator);
-    for (sections.items) |s| try ids.append(allocator, s.id);
-    try std.testing.expectEqualSlices(u8, &.{ SEC_MEMORY, SEC_TAG, SEC_GLOBAL, SEC_EXPORT, SEC_DATA }, ids.items);
-
-    const extracted = try extractIndex(allocator, patched);
-    defer allocator.free(extracted);
-    try std.testing.expectEqualSlices(u8, &index, extracted);
+    for (sections.items) |s| {
+        // The patcher must not add global or export sections
+        try std.testing.expect(s.id != SEC_GLOBAL);
+    }
+    // Export section count is unchanged from the input (1 export: "memory")
+    for (sections.items) |s| {
+        if (s.id == SEC_EXPORT) {
+            var off: usize = 0;
+            try std.testing.expectEqual(@as(u32, 1), try readLebU32(s.payload, &off));
+        }
+    }
 }
 
-test "embed: imported globals shift the new global indices" {
+test "embed: imported globals do not affect patching (no global logic)" {
     const allocator = std.testing.allocator;
-    // import 1 global ("e"."g" i32 const) + 1 defined global → new globals
-    // get indices 2 and 3; extract must still resolve them.
+    // import 1 global ("e"."g" i32 const) + memory + export + sentinel.
+    // The patcher doesn't touch globals at all — the sentinel scan is
+    // independent of the global index space.
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        // import: 1 entry, module "e", field "g", global i32 const
-        0x02, 0x08, 0x01, 0x01, 'e',  0x01, 'g',  0x03,
-        0x7F, 0x00,
-        // memory: 1 memory, flags 0, min 1
+        // import: 1 global, module "e", field "g", i32 const
+        0x02, 0x08, 0x01, 0x01, 'e', 0x01, 'g', 0x03, 0x7F, 0x00,
+        // memory: min 1
         0x05, 0x03, 0x01, 0x00, 0x01,
-        // global: 1 defined global, i32 const, i32.const 7
-        0x06, 0x06, 0x01, 0x7F, 0x00, 0x41, 0x07, 0x0B,
         // export: "memory" mem 0
-        0x07, 0x0A, 0x01, 0x06, 'm',  'e',  'm',  'o',
-        'r',  'y',  0x02, 0x00,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // data: sentinel at addr 512
+        0x0B, 0x0F, 0x01,
+        0x00, // flags: active, memory 0
+        0x41, 0x80, 0x04, 0x0B, // i32.const 512, end
+        0x08, // 8 bytes
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
     };
     const index = [_]u8{ 5, 6, 7, 8 };
     const patched = try embed(allocator, &module, &index);
     defer allocator.free(patched);
-
-    // Exported indices must account for the imported global
-    var sections = try parseSections(allocator, patched);
-    defer sections.deinit(allocator);
-    for (sections.items) |s| {
-        if (s.id != SEC_EXPORT) continue;
-        const scan = try scanExports(s.payload);
-        try std.testing.expect(scan.ptr_found and scan.len_found);
-        try std.testing.expectEqual(@as(u32, 2), scan.ptr_idx);
-        try std.testing.expectEqual(@as(u32, 3), scan.len_idx);
-    }
 
     const loc = try indexLocation(patched);
     try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
@@ -911,24 +858,14 @@ test "embed: imported memory rejected (would extend the wrong memory)" {
     const allocator = std.testing.allocator;
     const index = [_]u8{1};
 
-    // imported memory only
+    // imported memory only — no defined memory section
     const imported_only = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
         // import: 1 entry, module "e", field "m", memory flags 0 min 1
-        0x02, 0x08, 0x01, 0x01, 'e',  0x01, 'm',  0x02,
+        0x02, 0x08, 0x01, 0x01, 'e', 0x01, 'm', 0x02,
         0x00, 0x01,
     };
     try std.testing.expectError(error.UnsupportedMemory, embed(allocator, &imported_only, &index));
-
-    // imported memory + defined memory (multi-memory)
-    const imported_plus_defined = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        0x02, 0x08, 0x01, 0x01, 'e',  0x01, 'm',  0x02,
-        0x00, 0x01,
-        // memory: 1 defined memory, flags 0, min 1
-        0x05, 0x03, 0x01, 0x00, 0x01,
-    };
-    try std.testing.expectError(error.UnsupportedMemory, embed(allocator, &imported_plus_defined, &index));
 }
 
 test "embed: already patched module rejected" {
@@ -940,21 +877,40 @@ test "embed: already patched module rejected" {
     try std.testing.expectError(error.AlreadyPatched, embed(allocator, once, &index));
 }
 
-test "embed: export name conflict rejected" {
+test "embed: missing sentinel rejected" {
     const allocator = std.testing.allocator;
     const index = [_]u8{1};
 
-    // memory + export "chaza_index_ptr" of kind func (name taken, wrong kind)
-    const func_name_clash = [_]u8{
+    // memory + "memory" export + data segment WITHOUT sentinel
+    const no_sentinel = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        // memory
         0x05, 0x03, 0x01, 0x00, 0x01,
-        // export: 1 entry, "chaza_index_ptr" func 0
-        0x07, 0x13, 0x01, 0x0F, 'c',  'h',  'a',  'z',
-        'a',  '_',  'i',  'n',  'd',  'e',  'x',  '_',
-        'p',  't',  'r',  0x00, 0x00,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // data: 4 bytes at addr 0 (NOT the sentinel)
+        0x0B, 0x0A, 0x01,
+        0x00, 0x41, 0x00, 0x0B, 0x04, 0x01, 0x02, 0x03, 0x04,
     };
-    try std.testing.expectError(error.ExportNameConflict, embed(allocator, &func_name_clash, &index));
+    try std.testing.expectError(error.MetaSlotNotFound, embed(allocator, &no_sentinel, &index));
+}
+
+test "embed: multiple sentinels at different addresses rejected" {
+    const allocator = std.testing.allocator;
+    const index = [_]u8{1};
+
+    const dup_sentinel = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // data: 2 segments, sentinel at addr 0 AND addr 16
+        0x0B, 0x1B, 0x02,
+        // segment 0: sentinel at 0
+        0x00, 0x41, 0x00, 0x0B, 0x08,
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
+        // segment 1: sentinel at 16
+        0x00, 0x41, 0x10, 0x0B, 0x08,
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
+    };
+    try std.testing.expectError(error.MultipleMetaSlots, embed(allocator, &dup_sentinel, &index));
 }
 
 test "embed: invalid input rejected" {
@@ -982,15 +938,6 @@ test "parseSections: duplicate / misordered / unknown sections rejected" {
     };
     try std.testing.expectError(error.InvalidWasm, embed(allocator, &dup_memory, &index));
 
-    // export before memory (order violation)
-    const misordered = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        0x07, 0x0A, 0x01, 0x06, 'm',  'e',  'm',  'o',
-        'r',  'y',  0x02, 0x00,
-        0x05, 0x03, 0x01, 0x00, 0x01,
-    };
-    try std.testing.expectError(error.InvalidWasm, embed(allocator, &misordered, &index));
-
     // unknown non-custom section id 14
     const unknown = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
@@ -1006,8 +953,13 @@ test "parseSections: duplicate / misordered / unknown sections rejected" {
     try std.testing.expectError(error.InvalidWasm, embed(allocator, &truncated, &index));
 }
 
-test "extract: module without chaza exports rejected" {
-    try std.testing.expectError(error.MissingChazaExports, extractIndex(std.testing.allocator, &test_minimal_wasm));
+test "extract: module without sentinel rejected" {
+    const no_sentinel = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+    };
+    try std.testing.expectError(error.MetaSlotNotFound, extractIndex(std.testing.allocator, &no_sentinel));
 }
 
 test "embed: empty index still valid (0-byte segment, 0 extra pages)" {
@@ -1090,112 +1042,9 @@ test "sleb32 encode/decode roundtrip" {
     }
 }
 
-// ── emitNewGlobalSection / emitNewExportSection / append-data paths ─────
+// ── parseImports: import kind branches ──
 
-test "embed: module without global/export/data — all created from scratch" {
-    const allocator = std.testing.allocator;
-    // memory only — no global, export, or data sections present
-    const module = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        0x05, 0x03, 0x01, 0x00, 0x01, // memory: min 1
-    };
-    const index = [_]u8{ 1, 2, 3, 4 };
-    const patched = try embed(allocator, &module, &index);
-    defer allocator.free(patched);
-
-    var sections = try parseSections(allocator, patched);
-    defer sections.deinit(allocator);
-    var ids: std.ArrayList(u8) = .empty;
-    defer ids.deinit(allocator);
-    for (sections.items) |s| try ids.append(allocator, s.id);
-    try std.testing.expectEqualSlices(
-        u8,
-        &.{ SEC_MEMORY, SEC_GLOBAL, SEC_EXPORT, SEC_DATA },
-        ids.items,
-    );
-
-    const loc = try indexLocation(patched);
-    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
-    try std.testing.expectEqual(@as(u32, 4), loc.len);
-
-    const extracted = try extractIndex(allocator, patched);
-    defer allocator.free(extracted);
-    try std.testing.expectEqualSlices(u8, &index, extracted);
-}
-
-// ── readSimpleConstExpr: non-i32 const-expr branches ───────────────────
-
-test "indexLocation: walks globals with i64/f32/f64/global.get inits" {
-    const allocator = std.testing.allocator;
-    const module = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        // memory: min 1
-        0x05, 0x03, 0x01, 0x00, 0x01,
-        // global: 4 globals
-        0x06, 0x1F, 0x04,
-        // g0: i64 immut, i64.const 42
-        0x7E, 0x00, 0x42, 0x2A, 0x0B,
-        // g1: f32 immut, f32.const 1.0
-        0x7D, 0x00, 0x43, 0x00, 0x00, 0x80, 0x3F, 0x0B,
-        // g2: f64 immut, f64.const 1.0
-        0x7C, 0x00, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, 0x0B,
-        // g3: i32 immut, global.get 0
-        0x7F, 0x00, 0x23, 0x00, 0x0B,
-        // export "memory"
-        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
-    };
-    const index = [_]u8{ 10, 20, 30 };
-    const patched = try embed(allocator, &module, &index);
-    defer allocator.free(patched);
-
-    // chaza globals are at indices 4 and 5; indexLocation walks past the
-    // four non-chaza globals, exercising each const-expr branch.
-    const loc = try indexLocation(patched);
-    try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
-    try std.testing.expectEqual(@as(u32, 3), loc.len);
-
-    const extracted = try extractIndex(allocator, patched);
-    defer allocator.free(extracted);
-    try std.testing.expectEqualSlices(u8, &index, extracted);
-}
-
-test "readSimpleConstExpr: unsupported opcode and missing END rejected" {
-    const allocator = std.testing.allocator;
-    const index = [_]u8{ 1, 2, 3 };
-
-    // Global init with an unsupported opcode (0x00 = unreachable)
-    const bad_opcode = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        0x05, 0x03, 0x01, 0x00, 0x01,
-        // global: 1, i32 immut, opcode 0x00, end
-        0x06, 0x05, 0x01, 0x7F, 0x00, 0x00, 0x0B,
-        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
-    };
-    {
-        const patched = try embed(allocator, &bad_opcode, &index);
-        defer allocator.free(patched);
-        try std.testing.expectError(error.UnsupportedConstExpr, indexLocation(patched));
-    }
-
-    // i32.const followed by wrong byte (0x01 instead of END 0x0B)
-    const missing_end = [_]u8{
-        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
-        0x05, 0x03, 0x01, 0x00, 0x01,
-        // global: 1, i32 immut, i32.const 42, 0x01 (not END)
-        0x06, 0x06, 0x01, 0x7F, 0x00, 0x41, 0x2A, 0x01,
-        0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
-    };
-    {
-        const patched = try embed(allocator, &missing_end, &index);
-        defer allocator.free(patched);
-        try std.testing.expectError(error.UnsupportedConstExpr, indexLocation(patched));
-    }
-}
-
-// ── parseImports: import kind branches ─────────────────────────────────
-
-test "parseImports: func import (kind 0x00)" {
-    const allocator = std.testing.allocator;
+test "parseImports: func import (kind 0x00) counted" {
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
         // import: 1, module "e", field "f", func, typeidx 0
@@ -1204,13 +1053,16 @@ test "parseImports: func import (kind 0x00)" {
         0x05, 0x03, 0x01, 0x00, 0x01,
         // export "memory"
         0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // data: sentinel at addr 0
+        0x0B, 0x0E, 0x01,
+        0x00, 0x41, 0x00, 0x0B, 0x08,
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
     };
     const index = [_]u8{ 5, 6, 7 };
+    const allocator = std.testing.allocator;
     const patched = try embed(allocator, &module, &index);
     defer allocator.free(patched);
 
-    // func import → 0 imported globals, 0 imported memories;
-    // chaza globals at indices 0 and 1
     const loc = try indexLocation(patched);
     try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
     try std.testing.expectEqual(@as(u32, 3), loc.len);
@@ -1221,7 +1073,6 @@ test "parseImports: func import (kind 0x00)" {
 }
 
 test "parseImports: table import (kind 0x01)" {
-    const allocator = std.testing.allocator;
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
         // import: 1, module "e", field "t", table, funcref, limits 0/0
@@ -1230,42 +1081,39 @@ test "parseImports: table import (kind 0x01)" {
         0x05, 0x03, 0x01, 0x00, 0x01,
         // export "memory"
         0x07, 0x0A, 0x01, 0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00,
+        // data: sentinel at addr 0
+        0x0B, 0x0E, 0x01,
+        0x00, 0x41, 0x00, 0x0B, 0x08,
+        0xCE, 0xFA, 0xED, 0xFE, 0xCE, 0xFA, 0xED, 0xFE,
     };
     const index = [_]u8{ 8, 9 };
+    const allocator = std.testing.allocator;
     const patched = try embed(allocator, &module, &index);
     defer allocator.free(patched);
 
     const loc = try indexLocation(patched);
     try std.testing.expectEqual(@as(u32, WASM_PAGE_SIZE), loc.ptr);
     try std.testing.expectEqual(@as(u32, 2), loc.len);
-
-    const extracted = try extractIndex(allocator, patched);
-    defer allocator.free(extracted);
-    try std.testing.expectEqualSlices(u8, &index, extracted);
 }
 
 test "parseImports: tag import (kind 0x04) rejected" {
-    const allocator = std.testing.allocator;
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
         // import: 1, module "e", field "x", tag
         0x02, 0x06, 0x01, 0x01, 'e', 0x01, 'x', 0x04,
-        // memory: min 1
         0x05, 0x03, 0x01, 0x00, 0x01,
     };
     const index = [_]u8{1};
-    try std.testing.expectError(error.UnsupportedWasmFeature, embed(allocator, &module, &index));
+    try std.testing.expectError(error.UnsupportedWasmFeature, embed(std.testing.allocator, &module, &index));
 }
 
 test "parseImports: invalid import kind rejected" {
-    const allocator = std.testing.allocator;
     const module = [_]u8{
         0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
         // import: 1, module "e", field "x", kind 0x05 (invalid)
         0x02, 0x06, 0x01, 0x01, 'e', 0x01, 'x', 0x05,
-        // memory: min 1
         0x05, 0x03, 0x01, 0x00, 0x01,
     };
     const index = [_]u8{1};
-    try std.testing.expectError(error.InvalidWasm, embed(allocator, &module, &index));
+    try std.testing.expectError(error.InvalidWasm, embed(std.testing.allocator, &module, &index));
 }

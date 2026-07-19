@@ -61,22 +61,44 @@ const golden_doc_tokens = [_]DocTokens{
 
 // ── Helpers ──
 
+/// Golden corpus has 2 meta fields (author, date).
+const NUM_META: u32 = 2;
+
 fn resultCount(ptr: [*]const u8) u32 {
     return std.mem.readInt(u32, ptr[0..4], .little);
 }
 
-fn resultDocId(ptr: [*]const u8, i: usize) u32 {
-    return std.mem.readInt(u32, ptr[4 + i * 8 ..][0..4], .little);
+/// Walk to the i-th result entry offset.
+/// Each entry: [u32 hits][title\0][url\0][meta\0 × num_meta].
+fn nthEntryOff(ptr: [*]const u8, i: usize) usize {
+    var off: usize = 4; // skip count
+    for (0..i) |_| {
+        off += 4; // hits
+        const num_strings = 2 + NUM_META; // title, url, meta*N
+        for (0..num_strings) |_| {
+            while (ptr[off] != 0) off += 1;
+            off += 1; // skip NUL
+        }
+    }
+    return off;
+}
+
+fn resultTitle(ptr: [*]const u8, i: usize) []const u8 {
+    var off = nthEntryOff(ptr, i) + 4; // skip hits
+    const start = off;
+    while (ptr[off] != 0) off += 1;
+    return ptr[start..off];
 }
 
 fn resultHits(ptr: [*]const u8, i: usize) u32 {
-    return std.mem.readInt(u32, ptr[8 + i * 8 ..][0..4], .little);
+    const off = nthEntryOff(ptr, i);
+    return std.mem.readInt(u32, ptr[off..][0..4], .little);
 }
 
-/// Check if result set contains doc_id.
-fn resultContains(ptr: [*]const u8, count: u32, doc_id: u32) bool {
+/// Check if result set contains a title.
+fn resultContains(ptr: [*]const u8, count: u32, title: []const u8) bool {
     for (0..count) |i| {
-        if (resultDocId(ptr, i) == doc_id) return true;
+        if (std.mem.eql(u8, resultTitle(ptr, i), title)) return true;
     }
     return false;
 }
@@ -201,11 +223,11 @@ test "golden match: search('hello') → only documents with token hit (docs 0, 3
     defer runtime.testCleanup();
 
     const q = "hello";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 1));
 }
 
 test "golden match: search('hello') → documents without token miss (docs 1, 2, 4)" {
@@ -219,12 +241,12 @@ test "golden match: search('hello') → documents without token miss (docs 1, 2,
     defer runtime.testCleanup();
 
     const q = "hello";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
     const count = resultCount(r);
 
-    try std.testing.expect(!resultContains(r, count, 1));
-    try std.testing.expect(!resultContains(r, count, 2));
-    try std.testing.expect(!resultContains(r, count, 4));
+    try std.testing.expect(!resultContains(r, count, "Zig Programming"));
+    try std.testing.expect(!resultContains(r, count, "안녕하세요"));
+    try std.testing.expect(!resultContains(r, count, "Empty Body"));
 }
 
 // ── C. Representative golden corpus cases ──
@@ -244,12 +266,12 @@ test "golden: search('안녕') → doc 3 (exact) + doc 2 (title prefix of 안녕
     // (title word 안녕하세요, prefix_fields=title) with no title_hits.
     // Count is not asserted exactly: filter false positives may add a doc.
     const q = "안녕";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
     const count = resultCount(r);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 0)); // title match first
-    try std.testing.expect(resultContains(r, count, 2));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 0)); // title match first
+    try std.testing.expect(resultContains(r, count, "안녕하세요"));
 }
 
 test "golden prefix: search('hel') → title-word prefix hits docs 0, 3" {
@@ -265,11 +287,11 @@ test "golden prefix: search('hel') → title-word prefix hits docs 0, 3" {
     // 'hel' exact matches nothing; prefix \x02hel comes from titles containing
     // 'Hello' (docs 0, 3). doc 1's body has no prefix tokens (body ∉ prefix_fields).
     const q = "hel";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 1));
 }
 
 test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
@@ -287,10 +309,10 @@ test "golden prefix: body words get no prefix tokens ('progr' → no hits)" {
     // doc 1 title 'Zig Programming' → \x02progr exists → doc 1 hit.
     // doc 0 has 'programming' only in body → no prefix token → miss.
     const q = "progr";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 0));
+    try std.testing.expectEqualStrings("Zig Programming", resultTitle(r, 0));
 }
 
 test "golden: search('ㅎ') → no hit (body-only single-jamo choseong skipped)" {
@@ -306,7 +328,7 @@ test "golden: search('ㅎ') → no hit (body-only single-jamo choseong skipped)"
     // '한글' is body-only in doc 2; single-jamo choseong (\x01ㅎ) is not
     // generated for body tokens (writer min_len=2). 'ㅎ' → 0 results.
     const q = "ㅎ";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(r));
 }
@@ -324,12 +346,12 @@ test "golden: search('ㅇ') → docs 2, 3 hit (title single-jamo choseong preser
     // '안녕하세요' is a title word in doc 2; '안녕' is a title word in doc 3.
     // Title tokens keep length-1 choseong (\x01ㅇ) from the generator.
     const q = "ㅇ";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
     const count = resultCount(r);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expect(resultContains(r, count, 2));
-    try std.testing.expect(resultContains(r, count, 3));
+    try std.testing.expect(resultContains(r, count, "안녕하세요"));
+    try std.testing.expect(resultContains(r, count, "Hello 안녕"));
 }
 
 test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → input order)" {
@@ -343,11 +365,11 @@ test "golden: search('hello world') → docs 0, 3 hit (both tokens, tie → inpu
     defer runtime.testCleanup();
 
     const q = "hello world";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 1));
 }
 
 test "golden: empty query → count=0" {
@@ -361,7 +383,7 @@ test "golden: empty query → count=0" {
     defer runtime.testCleanup();
 
     const q = "";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(r));
 }
@@ -377,7 +399,7 @@ test "golden: non-existent token → count=0" {
     defer runtime.testCleanup();
 
     const q = "zzznonexistentzzz";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(r));
 }
@@ -395,13 +417,13 @@ test "golden ranking: 'hello programming' → doc 0 (2 hits) first, then partial
     defer runtime.testCleanup();
 
     const q = "hello programming";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     // doc 0: hello+programming (hits 2). doc 1: programming (1). doc 3: hello (1).
     try std.testing.expectEqual(@as(u32, 3), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 1));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 2));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Zig Programming", resultTitle(r, 1));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 2));
     try std.testing.expectEqual(@as(u32, 2), resultHits(r, 0));
     try std.testing.expectEqual(@as(u32, 1), resultHits(r, 1));
     try std.testing.expectEqual(@as(u32, 1), resultHits(r, 2));
@@ -418,12 +440,12 @@ test "golden ranking: unknown token doesn't kill partial matches ('hello zzznone
     defer runtime.testCleanup();
 
     const q = "hello zzznonexistentzzz";
-    const r = runtime.search(q.ptr, q.len, 0);
+    const r = runtime.doSearch(q, 0);
 
     // 'hello' docs (0, 3) survive with hits 1 — the unknown token no longer zeroes results
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(r, 1));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Hello 안녕", resultTitle(r, 1));
 }
 
 test "golden: max_results=2 → return max 2 (top-ranked first)" {
@@ -437,10 +459,10 @@ test "golden: max_results=2 → return max 2 (top-ranked first)" {
     defer runtime.testCleanup();
 
     const q = "chaza";
-    const r = runtime.search(q.ptr, q.len, 2);
+    const r = runtime.doSearch(q, 2);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(r));
     // All docs hits 1 → input order: docs 0, 1
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r, 0));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(r, 1));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r, 0));
+    try std.testing.expectEqualStrings("Zig Programming", resultTitle(r, 1));
 }

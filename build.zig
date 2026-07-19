@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .target = runtime_target,
         .optimize = .ReleaseSmall,
     });
-    runtime_mod.export_symbol_names = &.{ "alloc", "set_index", "search" };
+    runtime_mod.export_symbol_names = &.{ "prepare_query", "meta_fields", "search" };
     const runtime_exe = b.addExecutable(.{
         .name = "runtime",
         .root_module = runtime_mod,
