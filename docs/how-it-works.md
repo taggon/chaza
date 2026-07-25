@@ -9,11 +9,11 @@ build time                              runtime (browser)
 ──────────                              ─────────────────
 corpus.json ─┐                          fetch(chaza.wasm)
 chaza.json  ─┤                            │
-             ▼                            ▼
-        chaza CLI ──► chaza.wasm  ──► chaza.js loader
-        (patches          │              ├─ instantiate (streaming-capable)
-       runtime.wasm)      │              ├─ read chaza_index_ptr/len globals
-                          └──────────────┴─ set_index() → search()
+              ▼                            ▼
+          chaza CLI ──► chaza.wasm  ──► chaza.js loader
+          (patches          │              ├─ instantiate (streaming-capable)
+         runtime.wasm)      │              ├─ read metadata slot via meta_fields()
+                            └──────────────┴─ search() (runtime self-initializes)
 ```
 
 The runtime WASM is compiled **once** and embedded in the CLI binary. Building an index never compiles anything — the CLI tokenizes the corpus, builds filters, and patches the index bytes into the runtime module as a data segment. This is the main difference from tinysearch, which generates and compiles a Rust crate per index.
@@ -76,7 +76,7 @@ The filters are the only representation stored — no original text or token lis
 
 ## Search execution
 
-`search(query_ptr, query_len, max_results)` runs entirely inside the WASM module:
+`search(query_len, max_results)` runs entirely inside the WASM module (the query itself was copied into the runtime-owned buffer via `prepare_query`):
 
 1. Tokenize the query with the same pipeline as indexing
 2. Mark choseong-only tokens with `\x01`; build the `\x02` prefix probe for the last token
@@ -84,9 +84,9 @@ The filters are the only representation stored — no original text or token lis
 4. For every document, count how many query tokens hit the lo filter under that document's pair key (`hits`) and how many hit as `\x03` title probes in the hi filter (`title_hits`)
 5. Keep documents with `hits ≥ 1`, sort by `hits` desc, then `title_hits` desc, then document input order
 6. Truncate to `max_results` (0 → 20)
-7. Return a buffer: `[u32 count][(u32 doc_id, u32 hits) × count]`, little-endian
+7. Materialize the results into a single buffer: `[u32 count][per result: [u32 hits][title\0][url\0][meta_value\0 × num_meta_fields]]`, little-endian
 
-The loader reads doc ids, then resolves title / url / metadata from the string pool and exposes `hits` on each result.
+The loader parses that buffer directly into `{ title, url, meta, hits }` objects — wasm owns all string materialization, so no separate string-pool lookup happens on the JS side.
 
 ### Why cap at 16 tokens?
 
@@ -98,9 +98,9 @@ OR semantics means every token gives every document an independent ~0.2% false-p
 
 - **memory section**: initial pages extended so the index region fits inside initial memory
 - **data section**: one active data segment at the old memory end (page-aligned) carrying the index bytes
-- **global + export sections**: two immutable i32 globals, exported as `chaza_index_ptr` / `chaza_index_len`, publish the index location
+- **data section**: two active segments added — a metadata segment (8 bytes: index ptr+len LE) written to the runtime's `g_embedded_index` slot, and an index segment carrying the index bytes at the old memory end
 
-The loader instantiates the module — `WebAssembly.instantiateStreaming` works, so compilation overlaps the download — reads the two globals, and calls `set_index(ptr, len)`. The index bytes are already in wasm memory via the data segment; no alloc/copy happens at load time. Memory growth (from query `alloc`) never moves wasm linear memory, so the index region stays valid.
+The loader instantiates the module — `WebAssembly.instantiateStreaming` works when the server returns `application/wasm`, so compilation overlaps the download — reads the metadata slot via `meta_fields()`, and calls `search()`. The runtime self-initializes the `IndexView` from the embedded metadata; no `set_index` call or index copy happens at load time. The query buffer is runtime-owned (`prepare_query`), so JS no longer manages allocation policy. Memory growth never moves wasm linear memory, so the index region stays valid.
 
 The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`, with filter-data holding the two global blobs as `[lo_len][hi_len][lo][hi]`) that the runtime reads zero-parse via pointer casts. See [SPEC.md](../SPEC.md) for field-level detail.
 

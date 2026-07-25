@@ -5,15 +5,15 @@
 ## 아키텍처
 
 ```
-빌드 시점                               런타임 (브라우저)
-────────                               ─────────────────
+빌드 시점                             런타임 (브라우저)
+──────────                             ────────────────
 corpus.json ─┐                          fetch(chaza.wasm)
 chaza.json  ─┤                            │
-             ▼                            ▼
-        chaza CLI ──► chaza.wasm  ──► chaza.js 로더
-       (runtime.wasm       │             ├─ 인스턴스화 (스트리밍 가능)
-        패치)              │             ├─ chaza_index_ptr/len 글로벌 읽기
-                           └─────────────┴─ set_index() → search()
+              ▼                            ▼
+          chaza CLI ──► chaza.wasm  ──► chaza.js 로더
+          (패치              │              ├─ 인스턴스화 (streaming 지원)
+         runtime.wasm)      │              ├─ meta_fields()로 메타데이터 슬롯 읽기
+                            └─────────────┴─ search() (런타임이 자체 초기화)
 ```
 
 런타임 WASM은 **한 번만** 컴파일되어 CLI 바이너리에 내장됩니다. 인덱스를 만들 때는 아무것도 컴파일하지 않습니다 — CLI가 코퍼스를 토큰화하고 필터를 만들어 인덱스 바이트를 런타임 모듈의 데이터 세그먼트로 패치해 넣을 뿐. 인덱스 빌드마다 Rust 크레이트를 생성·컴파일하는 tinysearch와의 핵심 차이입니다.
@@ -76,7 +76,7 @@ v1.3까지는 문서마다 8비트 필터를 따로 만들었습니다. 문서 �
 
 ## 검색 실행
 
-`search(query_ptr, query_len, max_results)`는 전부 WASM 안에서 실행됩니다:
+`search(query_len, max_results)`는 전부 WASM 안에서 실행됩니다 (쿼리 자체는 `prepare_query`로 런타임 소유 버퍼에 미리 복사됨):
 
 1. 색인과 동일한 파이프라인으로 쿼리 토큰화
 2. 초성 전용 토큰에 `\x01` 마킹, 마지막 토큰의 `\x02` prefix 프로브 생성
@@ -84,9 +84,9 @@ v1.3까지는 문서마다 8비트 필터를 따로 만들었습니다. 문서 �
 4. 모든 문서에 대해 필터에 hit하는 쿼리 토큰 수(`hits`)와 `\x03` title 프로브 hit 수(`title_hits`) 계산
 5. `hits ≥ 1` 문서만 후보, `hits` 내림차순 → `title_hits` 내림차순 → 문서 입력 순 정렬
 6. `max_results`로 자르기 (0 → 20)
-7. 결과 버퍼 반환: `[u32 count][(u32 doc_id, u32 hits) × count]`, little-endian
+7. 결과를 단일 버퍼로 materialize: `[u32 count][결과마다: [u32 hits][title\0][url\0][meta_value\0 × num_meta_fields]]`, little-endian
 
-로더가 doc id로 문자열 풀에서 title / url / 메타를 꺼내고, 각 결과에 `hits`를 노출합니다.
+로더는 이 버퍼를 `{ title, url, meta, hits }` 객체로 바로 파싱합니다 — 문자열 materialize는 wasm이 전담해서 JS 쪽에서 string pool을 조회할 일은 없습니다.
 
 ### 왜 토큰 상한이 16인가?
 
@@ -98,9 +98,9 @@ OR 의미론에서는 토큰마다 모든 문서가 독립적으로 ~0.2% 오탐
 
 - **memory 섹션**: 인덱스 영역이 초기 메모리 안에 들어가도록 초기 페이지 수 확장
 - **data 섹션**: 기존 메모리 끝(페이지 정렬)에 인덱스 바이트를 담은 active 데이터 세그먼트 1개 추가
-- **global + export 섹션**: 인덱스 위치를 알리는 불변 i32 글로벌 2개를 `chaza_index_ptr` / `chaza_index_len`으로 export
+- **데이터 섹션**: active 세그먼트 2개 추가 — 런타임의 `g_embedded_index` 슬롯에 기록되는 메타데이터 세그먼트(8바이트: 인덱스 ptr+len LE)와, 옛 메모리 끝에 인덱스 바이트를 실은 인덱스 세그먼트
 
-로더는 모듈을 인스턴스화하고 — `WebAssembly.instantiateStreaming`이 동작하므로 다운로드와 컴파일이 겹칩니다 — 글로벌 2개를 읽어 `set_index(ptr, len)`를 호출합니다. 인덱스 바이트는 데이터 세그먼트를 통해 이미 wasm 메모리에 올라와 있어 로드 시점 alloc/복사가 없습니다. 쿼리용 `alloc`으로 메모리가 늘어나도 wasm 선형 메모리는 이동하지 않으므로 인덱스 영역은 계속 유효합니다.
+로더는 모듈을 인스턴스화하고 — 서버가 `application/wasm`을 반환하면 `WebAssembly.instantiateStreaming`이 동작하여 다운로드와 컴파일이 겹칩니다 — `meta_fields()`로 메타데이터 슬롯을 읽고 `search()`를 호출합니다. 런타임은 임베디드 메타데이터에서 `IndexView`를 자체 초기화하므로 로드 시점에 `set_index` 호출이나 인덱스 복사가 없습니다. 쿼리 버퍼는 런타임 소유(`prepare_query`)이므로 JS가 할당 정책을 관리하지 않습니다. 메모리가 늘어나도 wasm 선형 메모리는 이동하지 않으므로 인덱스 영역은 계속 유효합니다.
 
 인덱스 자체는 flat, 4바이트 정렬, little-endian 레이아웃(`[header][meta-names][doc-table][string-pool][filter-data]`, filter-data는 전역 blob 2개를 `[lo_len][hi_len][lo][hi]`로 보관)이고 런타임이 포인터 캐스트로 zero-parse로 읽습니다. 필드 단위 상세는 [SPEC.md](../SPEC.md) 참고.
 

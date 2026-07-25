@@ -5,7 +5,12 @@
 //! pairKey(doc_id, token key) (OR lookup; hits = hit token count) plus the hi
 //! filter for prefix (0x02) and title-ranking (0x03) probes → sort by hits
 //! desc, title_hits desc, input order → result encoding.
-//! Results written to global buffer in [u32 count LE][(u32 doc_id, u32 hits) × count LE] format.
+//!
+//! Result buffer format (NUL-separated, wasm materializes all strings):
+//!   [u32 count LE]
+//!   per result:
+//!     [u32 hits LE]
+//!     title\0 url\0 meta_value_1\0 ... meta_value_N\0
 
 const std = @import("std");
 const reader = @import("index/reader.zig");
@@ -21,26 +26,95 @@ const format = @import("index/format.zig");
 
 var g_index: ?reader.IndexView = null;
 var g_result_buffer: std.ArrayList(u8) = .empty;
+var g_query_buffer: std.ArrayList(u8) = .empty;
+var g_meta_names_buf: std.ArrayList(u8) = .empty;
 const g_allocator: std.mem.Allocator = std.heap.page_allocator;
 
 /// Static empty result on alloc failure (count=0 LE).
 const empty_result: [4]u8 = .{ 0, 0, 0, 0 };
 
+/// Embedded index metadata slot. The wasm patcher writes an active data
+/// segment at this address carrying (ptr, len) of the embedded index, so
+/// the runtime self-initializes without a JS-facing set_index call.
+/// The slot is initialized to a sentinel pattern (0xFEEDFACE × 2); the
+/// patcher scans the data section for this pattern to discover the slot
+/// address at build time, then overwrites it with the real values.
+const EmbeddedIndexMeta = extern struct {
+    ptr: u32,
+    len: u32,
+};
+
+const META_SENTINEL: u32 = 0xFEEDFACE;
+
+var g_embedded_index: EmbeddedIndexMeta align(4) = .{
+    .ptr = META_SENTINEL,
+    .len = META_SENTINEL,
+};
+
+/// Lazily open the IndexView from the embedded metadata. Returns the cached
+/// view if already open (via set_index in tests or a prior call).
+///
+/// The slot is read via a volatile pointer because the compiler sees no
+/// writes to g_embedded_index in the wasm build (the patcher's data segment
+/// overwrites it at instantiation time, which is invisible to the compiler).
+/// Without volatile the optimizer would constant-fold the sentinel check
+/// to always-true and eliminate the slot from the data section entirely.
+fn ensureIndex() ?reader.IndexView {
+    if (g_index == null) {
+        const slot: *volatile EmbeddedIndexMeta = @ptrCast(&g_embedded_index);
+        if (slot.ptr == META_SENTINEL or slot.len == META_SENTINEL) return null;
+        const ptr: [*]const u8 = @ptrFromInt(slot.ptr);
+        g_index = reader.IndexView.open(ptr[0..slot.len]) catch null;
+    }
+    return g_index;
+}
+
 // ── export API ──
 //
 // callconv(.c) — wasm32 uses wasm-compatible C calling convention. @export exposes symbol.
 
-/// JS memory allocation request. Secure n bytes with page_allocator and return pointer.
-pub fn alloc(n: usize) callconv(.c) [*]u8 {
-    const buf = g_allocator.alloc(u8, n) catch @panic("chaza: alloc failed");
-    return buf.ptr;
+/// Ensure the query buffer can hold `len` bytes and return a writable pointer.
+/// The runtime owns the buffer (resized in place, reused across calls), so JS
+/// no longer manages query allocation policy.
+pub fn prepareQuery(len: usize) callconv(.c) [*]u8 {
+    g_query_buffer.resize(g_allocator, len) catch @panic("chaza: query allocation failed");
+    return g_query_buffer.items.ptr;
 }
 
-/// Register index bytes. In the browser, ptr/len come from the
-/// chaza_index_ptr/len globals the wasm patcher exported — the index data
-/// segment sits inside initial memory, so later memory growth (query alloc)
-/// never invalidates it (wasm linear memory doesn't move on grow).
-pub fn set_index(ptr: [*]const u8, len: usize) callconv(.c) void {
+/// Return a pointer to the index info buffer:
+///   [u32 num_docs LE][u32 num_meta_fields LE][name1\0 name2\0 ...]
+/// JS reads this once at load time for the document count and meta field
+/// schema. The buffer is built lazily on first call and cached.
+pub fn metaFields() callconv(.c) [*]const u8 {
+    if (g_meta_names_buf.items.len > 0) return g_meta_names_buf.items.ptr;
+
+    const view = ensureIndex() orelse {
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        return g_meta_names_buf.items.ptr;
+    };
+
+    appendU32LE(&g_meta_names_buf, view.header.num_docs) catch {
+        g_meta_names_buf.clearRetainingCapacity();
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        return g_meta_names_buf.items.ptr;
+    };
+    appendU32LE(&g_meta_names_buf, view.header.num_meta_fields) catch {
+        g_meta_names_buf.clearRetainingCapacity();
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        appendU32LE(&g_meta_names_buf, 0) catch {};
+        return g_meta_names_buf.items.ptr;
+    };
+    for (0..view.header.num_meta_fields) |i| {
+        const name = view.metaNameAt(i) orelse "";
+        appendStringNul(&g_meta_names_buf, name) catch break;
+    }
+    return g_meta_names_buf.items.ptr;
+}
+
+/// Register index bytes directly (test helper — not exported to wasm).
+pub fn set_index(ptr: [*]const u8, len: usize) void {
     const bytes = ptr[0..len];
     g_index = reader.IndexView.open(bytes) catch {
         g_index = null;
@@ -56,20 +130,22 @@ const max_query_tokens = 16;
 
 /// Execute search. Return result buffer pointer ([u32 count LE][(u32 doc_id, u32 hits) × count LE]).
 pub fn search(
-    query_ptr: [*]const u8,
     query_len: usize,
     max_results: u32,
 ) callconv(.c) [*]const u8 {
-    const view = g_index orelse return writeEmptyResult();
+    const view = ensureIndex() orelse return writeEmptyResult();
 
     // arena: tokenize memory all freed at search end
     var arena = std.heap.ArenaAllocator.init(g_allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    // Query bytes come from the runtime-owned query buffer
+    const query_bytes = g_query_buffer.items[0..query_len];
+
     // Query tokenization
     var tokens: std.ArrayList([]const u8) = .empty;
-    tokenize.tokenize(arena_alloc, query_ptr[0..query_len], &tokens) catch return writeEmptyResult();
+    tokenize.tokenize(arena_alloc, query_bytes, &tokens) catch return writeEmptyResult();
 
     // Choseong query processing: add marker to tokens composed only of choseong jamo
     choseong.markChoseongQueries(arena_alloc, &tokens) catch return writeEmptyResult();
@@ -126,12 +202,19 @@ pub fn search(
     const effective_max: usize = if (max_results == 0) 20 else @intCast(max_results);
     const count: usize = @min(candidates.items.len, effective_max);
 
-    // Result encoding: [u32 count LE][(u32 doc_id, u32 hits) × count LE]
+    // Result encoding (NUL-separated, wasm materializes all strings):
+    //   [u32 count LE]
+    //   per result: [u32 hits LE][title\0][url\0][meta_value\0 × num_meta_fields]
     g_result_buffer.clearRetainingCapacity();
-    appendU32LE(&g_result_buffer, @intCast(count)) catch return @ptrCast(&empty_result);
+    appendU32LE(&g_result_buffer, @intCast(count)) catch return writeEmptyResult();
     for (0..count) |i| {
-        appendU32LE(&g_result_buffer, candidates.items[i].doc_id) catch return @ptrCast(&empty_result);
-        appendU32LE(&g_result_buffer, candidates.items[i].hits) catch return @ptrCast(&empty_result);
+        const did = candidates.items[i].doc_id;
+        appendU32LE(&g_result_buffer, candidates.items[i].hits) catch return writeEmptyResult();
+        appendStringNul(&g_result_buffer, view.title(did) orelse "") catch return writeEmptyResult();
+        appendStringNul(&g_result_buffer, view.url(did) orelse "") catch return writeEmptyResult();
+        for (0..view.header.num_meta_fields) |j| {
+            appendStringNul(&g_result_buffer, view.metaValue(did, j) orelse "") catch return writeEmptyResult();
+        }
     }
 
     return g_result_buffer.items.ptr;
@@ -192,11 +275,17 @@ fn countHitTokens(
     return score;
 }
 
-/// Append u32 little-endian to result buffer.
+/// Append u32 little-endian to a buffer.
 fn appendU32LE(buf: *std.ArrayList(u8), val: u32) !void {
     var tmp: [4]u8 = undefined;
     std.mem.writeInt(u32, &tmp, val, .little);
     try buf.appendSlice(g_allocator, &tmp);
+}
+
+/// Append a byte slice followed by a NUL terminator.
+fn appendStringNul(buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.appendSlice(g_allocator, s);
+    try buf.append(g_allocator, 0);
 }
 
 /// Write empty result (count=0) to g_result_buffer and return pointer.
@@ -234,20 +323,52 @@ fn resultCount(ptr: [*]const u8) u32 {
     return std.mem.readInt(u32, ptr[0..4], .little);
 }
 
-/// Read i-th doc_id from result buffer ((doc_id, hits) pair stride 8).
-fn resultDocId(ptr: [*]const u8, i: usize) u32 {
-    return std.mem.readInt(u32, ptr[4 + i * 8 ..][0..4], .little);
+/// buildCorpus has 1 meta field per doc.
+const TEST_NUM_META: u32 = 1;
+
+/// Walk to the i-th result entry offset (past count u32 + i variable-length entries).
+/// Each entry: [u32 hits][title\0][url\0][meta\0 × num_meta].
+fn nthEntryOff(ptr: [*]const u8, i: usize, num_meta: u32) usize {
+    var off: usize = 4; // skip count
+    for (0..i) |_| {
+        off += 4; // hits
+        const num_strings = 2 + num_meta; // title, url, meta*N
+        for (0..num_strings) |_| {
+            while (ptr[off] != 0) off += 1;
+            off += 1; // skip NUL
+        }
+    }
+    return off;
+}
+
+/// Read i-th title from result buffer (NUL-terminated after hits u32).
+fn resultTitle(ptr: [*]const u8, i: usize) []const u8 {
+    var off = nthEntryOff(ptr, i, TEST_NUM_META) + 4; // skip hits
+    const start = off;
+    while (ptr[off] != 0) off += 1;
+    return ptr[start..off];
 }
 
 /// Read i-th hits from result buffer.
 fn resultHits(ptr: [*]const u8, i: usize) u32 {
-    return std.mem.readInt(u32, ptr[8 + i * 8 ..][0..4], .little);
+    const off = nthEntryOff(ptr, i, TEST_NUM_META);
+    return std.mem.readInt(u32, ptr[off..][0..4], .little);
 }
 
-/// Test cleanup: release g_index + clear result buffer.
+/// Test cleanup: release g_index + clear buffers.
 pub fn testCleanup() void {
     g_index = null;
+    g_embedded_index = .{ .ptr = META_SENTINEL, .len = META_SENTINEL };
     g_result_buffer.clearRetainingCapacity();
+    g_query_buffer.clearRetainingCapacity();
+    g_meta_names_buf.clearRetainingCapacity();
+}
+
+/// Test helper: write query into g_query_buffer and run search.
+pub fn doSearch(query: []const u8, max_results: u32) [*]const u8 {
+    const ptr = prepareQuery(query.len);
+    @memcpy(ptr[0..query.len], query);
+    return search(query.len, max_results);
 }
 
 test "Single token 'hello' → 4 docs hit (input order)" {
@@ -258,13 +379,13 @@ test "Single token 'hello' → 4 docs hit (input order)" {
     defer testCleanup();
 
     const q = "hello";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 0));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 1));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(result, 2));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 3));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(result, 0));
+    try std.testing.expectEqualStrings("Hello Zig", resultTitle(result, 1));
+    try std.testing.expectEqualStrings("Hello WASM", resultTitle(result, 2));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 3));
 }
 
 test "Non-existent token → count=0" {
@@ -275,7 +396,7 @@ test "Non-existent token → count=0" {
     defer testCleanup();
 
     const q = "zzznonexistentzzz";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
@@ -288,14 +409,14 @@ test "Multiple tokens OR ranking: 'hello zig' → doc 1 (2 hits) first, rest inp
     defer testCleanup();
 
     const q = "hello zig";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     // doc 1 hits both tokens (hits 2) → first. docs 0/2/3 hit only 'hello' (hits 1) → input order.
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 0));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 1));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(result, 2));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 3));
+    try std.testing.expectEqualStrings("Hello Zig", resultTitle(result, 0));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(result, 1));
+    try std.testing.expectEqualStrings("Hello WASM", resultTitle(result, 2));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 3));
     try std.testing.expectEqual(@as(u32, 2), resultHits(result, 0));
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 1));
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 2));
@@ -310,15 +431,15 @@ test "Multiple tokens OR: 'hello nonexistent' → partial matches still returned
     defer testCleanup();
 
     const q = "hello zzznonexistentzzz";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     // all 4 docs hit 'hello' (hits 1) → input order
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 0));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 0));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 1));
-    try std.testing.expectEqual(@as(u32, 2), resultDocId(result, 2));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 3));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(result, 0));
+    try std.testing.expectEqualStrings("Hello Zig", resultTitle(result, 1));
+    try std.testing.expectEqualStrings("Hello WASM", resultTitle(result, 2));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 3));
 }
 
 test "max_results=1 → return 1 only (top-ranked)" {
@@ -329,11 +450,11 @@ test "max_results=1 → return 1 only (top-ranked)" {
     defer testCleanup();
 
     const q = "hello zig";
-    const result = search(q.ptr, q.len, 1);
+    const result = doSearch(q, 1);
 
     // ranking → truncate: top-ranked doc 1 (hits 2) survives the cut
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("Hello Zig", resultTitle(result, 0));
     try std.testing.expectEqual(@as(u32, 2), resultHits(result, 0));
 }
 
@@ -345,7 +466,7 @@ test "max_results=0 → default 20 (return all)" {
     defer testCleanup();
 
     const q = "hello";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     // 4 doc corpus → all 4 returned (default 20 > 4)
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
@@ -368,15 +489,15 @@ test "Query token cap: 17th token ignored (hits ≤ 16)" {
     }
     try q_buf.appendSlice(allocator, "world");
 
-    const result = search(q_buf.items.ptr, q_buf.items.len, 0);
+    const result = doSearch(q_buf.items, 0);
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
     // doc 0 first only by input-order tie — its 'world' hit was dropped by the cap
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(result, 0));
     try std.testing.expectEqual(@as(u32, 16), resultHits(result, 0));
     try std.testing.expectEqual(@as(u32, 16), resultHits(result, 1));
 }
 
-test "Result buffer format: first 4 bytes LE u32 count + (doc_id, hits) pairs" {
+test "Result buffer format: count + hits + NUL-separated strings" {
     const allocator = std.testing.allocator;
     const bytes = try buildCorpus(allocator);
     defer allocator.free(bytes);
@@ -384,17 +505,20 @@ test "Result buffer format: first 4 bytes LE u32 count + (doc_id, hits) pairs" {
     defer testCleanup();
 
     const q = "world";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
-    // "world" only in doc 0
+    // "world" only in doc 0 → count=1
     const count = std.mem.readInt(u32, result[0..4], .little);
     try std.testing.expectEqual(@as(u32, 1), count);
 
-    const id = std.mem.readInt(u32, result[4..8], .little);
-    try std.testing.expectEqual(@as(u32, 0), id);
-
-    const hits = std.mem.readInt(u32, result[8..12], .little);
+    // hits = 1 (only "world" matched)
+    const hits = std.mem.readInt(u32, result[4..8], .little);
     try std.testing.expectEqual(@as(u32, 1), hits);
+
+    // title starts at byte 8, NUL-terminated
+    try std.testing.expectEqual(@as(u8, 'H'), result[8]);
+    const title = std.mem.sliceTo(result[8..], 0);
+    try std.testing.expectEqualStrings("Hello World", title);
 }
 
 test "Korean token '안녕' search" {
@@ -405,10 +529,10 @@ test "Korean token '안녕' search" {
     defer testCleanup();
 
     const q = "안녕";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 0));
 }
 
 test "Choseong query 'ㅇ' → no hit (writer-level single-jamo choseong skipped)" {
@@ -421,7 +545,7 @@ test "Choseong query 'ㅇ' → no hit (writer-level single-jamo choseong skipped
     // Writer corpus tokens are body-level: single-jamo choseong (min_len=2)
     // skips \x01ㅇ, so 'ㅇ' no longer matches '안녕'. Use 'ㅇㄴ' for 2-char match.
     const q = "ㅇ";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
@@ -434,10 +558,10 @@ test "Choseong query 'ㅇㄴ' → 안녕 doc (doc 3) hit (2-char prefix match)" 
     defer testCleanup();
 
     const q = "ㅇㄴ";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 0));
 }
 
 test "Choseong query 'ㄱ' → miss (안녕 starts with ㅇ, not ㄱ)" {
@@ -448,7 +572,7 @@ test "Choseong query 'ㄱ' → miss (안녕 starts with ㅇ, not ㄱ)" {
     defer testCleanup();
 
     const q = "ㄱ";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
@@ -463,10 +587,10 @@ test "Choseong query doesn't match normal Korean: 'ㅇ' ≠ '안녕' token" {
     // 'ㅇㄴ' choseong query converted to 0x01ㅇㄴ marker token → different from '안녕' token
     // but since choseong token 0x01ㅇㄴ exists in filter, doc 3 hit
     const q = "ㅇㄴ";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 3), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("안녕 Hello", resultTitle(result, 0));
 }
 
 test "English query 'hello' unaffected by choseong" {
@@ -477,7 +601,7 @@ test "English query 'hello' unaffected by choseong" {
     defer testCleanup();
 
     const q = "hello";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 4), resultCount(result));
 }
@@ -490,10 +614,10 @@ test "Prefix match: query 'worl' → doc 0 via \\x02worl prefix token" {
     defer testCleanup();
 
     const q = "worl";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 1), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 0));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(result, 0));
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 0));
 }
 
@@ -506,15 +630,15 @@ test "Prefix probe applies to last token only" {
 
     // 'worl' last → doc 0 gets hello(exact) + worl(prefix) = hits 2, first
     const q1 = "hello worl";
-    const r1 = search(q1.ptr, q1.len, 0);
+    const r1 = doSearch(q1, 0);
     try std.testing.expectEqual(@as(u32, 4), resultCount(r1));
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(r1, 0));
+    try std.testing.expectEqualStrings("Hello World", resultTitle(r1, 0));
     try std.testing.expectEqual(@as(u32, 2), resultHits(r1, 0));
     try std.testing.expectEqual(@as(u32, 1), resultHits(r1, 1));
 
     // 'worl' not last → no prefix probe, every doc hits only 'hello' (hits 1)
     const q2 = "worl hello";
-    const r2 = search(q2.ptr, q2.len, 0);
+    const r2 = doSearch(q2, 0);
     try std.testing.expectEqual(@as(u32, 4), resultCount(r2));
     try std.testing.expectEqual(@as(u32, 1), resultHits(r2, 0));
 }
@@ -539,11 +663,11 @@ test "Title boost: title match outranks earlier body-only match on equal hits" {
     defer testCleanup();
 
     const q = "alpha";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 2), resultCount(result));
-    try std.testing.expectEqual(@as(u32, 1), resultDocId(result, 0)); // title match first
-    try std.testing.expectEqual(@as(u32, 0), resultDocId(result, 1));
+    try std.testing.expectEqualStrings("Alpha", resultTitle(result, 0)); // title match first
+    try std.testing.expectEqualStrings("Beta", resultTitle(result, 1));
     // hits unchanged by the title probe — both docs matched 1 token
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 0));
     try std.testing.expectEqual(@as(u32, 1), resultHits(result, 1));
@@ -554,7 +678,7 @@ test "g_index not set → search → count=0" {
     defer testCleanup();
 
     const q = "hello";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
@@ -567,7 +691,7 @@ test "Empty query → count=0" {
     defer testCleanup();
 
     const q = "";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
 
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
@@ -580,52 +704,84 @@ test "set_index: invalid magic → g_index=null, search → count=0" {
     try std.testing.expect(g_index == null);
 
     const q = "test";
-    const result = search(q.ptr, q.len, 0);
+    const result = doSearch(q, 0);
     try std.testing.expectEqual(@as(u32, 0), resultCount(result));
 }
 
-// ── alloc export tests ──
+// ── prepareQuery tests ──
 
-test "alloc: returns writable, readable memory" {
-    const n: usize = 256;
-    const ptr = alloc(n);
-    const buf: []u8 = ptr[0..n];
-    defer g_allocator.free(buf);
-
-    for (buf, 0..) |*b, i| b.* = @intCast(i % 256);
+test "prepareQuery: returns writable memory of requested size" {
+    const len: usize = 256;
+    const ptr = prepareQuery(len);
+    const buf: [*]u8 = ptr;
+    for (0..len) |i| buf[i] = @intCast(i % 256);
     try std.testing.expectEqual(@as(u8, 0), buf[0]);
     try std.testing.expectEqual(@as(u8, 42), buf[42]);
     try std.testing.expectEqual(@as(u8, 255), buf[255]);
+    g_query_buffer.clearRetainingCapacity();
 }
 
-test "alloc: multiple sizes succeed" {
-    const sizes = [_]usize{ 1, 64, 4096, 65536 };
-    for (sizes) |n| {
-        const ptr = alloc(n);
-        const buf: []u8 = ptr[0..n];
-        defer g_allocator.free(buf);
-        buf[n - 1] = 0xAA;
-        try std.testing.expectEqual(@as(u8, 0xAA), buf[n - 1]);
-    }
+test "prepareQuery: reuse grows the buffer in place" {
+    const p1 = prepareQuery(64);
+    p1[0] = 0xAA;
+    try std.testing.expectEqual(@as(u8, 0xAA), g_query_buffer.items[0]);
+
+    // grow → items may move but the buffer covers the new size
+    const p2 = prepareQuery(4096);
+    try std.testing.expectEqual(@as(usize, 4096), g_query_buffer.items.len);
+    p2[4095] = 0xBB;
+    try std.testing.expectEqual(@as(u8, 0xBB), g_query_buffer.items[4095]);
+    g_query_buffer.clearRetainingCapacity();
 }
 
-test "alloc: distinct allocations do not alias" {
-    const n: usize = 128;
-    const p1: []u8 = alloc(n)[0..n];
-    defer g_allocator.free(p1);
-    const p2: []u8 = alloc(n)[0..n];
-    defer g_allocator.free(p2);
+test "ensureIndex: null when no index registered (metadata slot at sentinel)" {
+    defer testCleanup();
+    try std.testing.expect(ensureIndex() == null);
+}
 
-    try std.testing.expect(p1.ptr != p2.ptr);
-    for (p1) |*b| b.* = 0x11;
-    for (p2) |*b| b.* = 0x22;
-    try std.testing.expectEqual(@as(u8, 0x11), p1[0]);
-    try std.testing.expectEqual(@as(u8, 0x22), p2[0]);
+test "ensureIndex: returns cached view after set_index" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildCorpus(allocator);
+    defer allocator.free(bytes);
+    set_index(bytes.ptr, bytes.len);
+    defer testCleanup();
+
+    // ensureIndex returns the same cached view set by set_index
+    const view1 = ensureIndex();
+    const view2 = ensureIndex();
+    try std.testing.expect(view1 != null);
+    try std.testing.expect(view2 != null);
+}
+
+// ── metaFields tests ──
+
+test "metaFields: returns [num_docs][num_meta][name\\0...] for the loaded index" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildCorpus(allocator);
+    defer allocator.free(bytes);
+    set_index(bytes.ptr, bytes.len);
+    defer testCleanup();
+
+    const ptr = metaFields();
+    const num_docs = std.mem.readInt(u32, ptr[0..4], .little);
+    const num_meta = std.mem.readInt(u32, ptr[4..8], .little);
+    try std.testing.expectEqual(@as(u32, 4), num_docs);
+    try std.testing.expectEqual(@as(u32, 1), num_meta);
+    // "date" NUL-terminated after the two u32s
+    const name = std.mem.sliceTo(ptr[8..], 0);
+    try std.testing.expectEqualStrings("date", name);
+}
+
+test "metaFields: returns zeros when no index loaded" {
+    defer testCleanup();
+    const ptr = metaFields();
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ptr[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ptr[4..8], .little));
 }
 
 // ── wasm export forced (avoid lazy compilation) ──
 comptime {
-    @export(&alloc, .{ .name = "alloc" });
-    @export(&set_index, .{ .name = "set_index" });
+    @export(&prepareQuery, .{ .name = "prepare_query" });
+    @export(&metaFields, .{ .name = "meta_fields" });
     @export(&search, .{ .name = "search" });
 }
