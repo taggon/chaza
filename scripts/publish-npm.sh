@@ -10,11 +10,11 @@ publish_if_new() {
   name=$(node -p "require('./$dir/package.json').name")
   version=$(node -p "require('./$dir/package.json').version")
 
-  if npm view "$name@$version" >/dev/null 2>&1; then
+  if pnpm view "$name@$version" >/dev/null 2>&1; then
     echo "↩  skip   $name@$version (already published)"
   else
     echo "→  publish $name@$version"
-    npm publish "$dir" --access public
+    pnpm publish "$dir" --access public --no-git-checks
   fi
 }
 
@@ -25,5 +25,5 @@ for dir in npm/@chaza-cli/*/; do
   publish_if_new "${dir%/}"
 done
 
-# Main package (loader + bin shim). Requires a prior `npm ci` + `npm run build`.
+# Main package (loader + bin shim). Requires a prior `pnpm install` + `pnpm run build`.
 publish_if_new npm/chaza

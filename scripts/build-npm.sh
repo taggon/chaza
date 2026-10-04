@@ -25,7 +25,7 @@ mkdir -p "$SCOPE_DIR"
 
 # Compile TypeScript loader
 echo "→ Compiling TypeScript..."
-(cd "$NPM_DIR/chaza" && npm run build)
+(cd "$NPM_DIR/chaza" && pnpm run build)
 
 # Copy LICENSE to npm root
 cp "$ROOT/LICENSE" "$NPM_DIR/chaza/LICENSE"
