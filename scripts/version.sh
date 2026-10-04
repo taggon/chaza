@@ -26,6 +26,9 @@ for (const key of Object.keys(pkg.optionalDependencies)) {
 fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
 "
 
+# pnpm lockfile (optionalDependencies specifiers change with the version bump)
+(cd npm/chaza && pnpm install --lockfile-only)
+
 echo "Bumped to ${NEW_VERSION}"
 echo ""
 echo "Changed files:"
