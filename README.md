@@ -154,8 +154,7 @@ Numbers are stringified automatically.
 
 ## Documentation
 
-- [How it works](docs/how-it-works.md) — tokenization pipeline, choseong/prefix tokens, binary fuse filters, bundle format, size limits
-- [SPEC.md](SPEC.md) — full format and behavior specification
+- [How it works](docs/how-it-works.md) — tokenization pipeline, choseong/prefix tokens, binary fuse filters, wasm output format, size limits
 
 ## License
 

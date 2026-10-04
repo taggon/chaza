@@ -154,8 +154,7 @@ chaza build <corpus.json> [옵션]
 
 ## 문서
 
-- [작동 원리](docs/how-it-works.ko.md) — 토큰화 파이프라인, 초성/prefix 토큰, binary fuse filter, 번들 포맷, 규모 한계
-- [SPEC.md](SPEC.md) — 포맷·동작 전체 명세
+- [작동 원리](docs/how-it-works.ko.md) — 토큰화 파이프라인, 초성/prefix 토큰, binary fuse filter, wasm 출력 포맷, 규모 한계
 
 ## 라이선스
 
