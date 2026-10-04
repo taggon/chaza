@@ -1,6 +1,6 @@
 # How Chaza works
 
-Internals of the index, the filters, and the search runtime. For usage, see the [README](../README.md); for the full format specification, see [SPEC.md](../SPEC.md).
+Internals of the index, the filters, and the search runtime. For usage, see the [README](../README.md).
 
 ## Architecture
 
@@ -28,7 +28,8 @@ Shared by the indexer (native) and the runtime (wasm) as the same Zig code — b
 4. Deduplicate per document
 5. If `choseong_search`: add choseong prefix tokens (marker `\x01`), length 2–`choseong_max_len` for body words; title words keep length 1–`choseong_max_len`
 6. Words in `prefix_fields`: add edge n-gram prefix tokens (marker `\x02`), first 2–8 codepoints (proper prefixes only)
-7. Deduplicate again
+7. Tokens from the title field (and their choseong tokens) are indexed a second time with a `\x03` marker — the title-ranking signal (see below)
+8. Deduplicate again
 
 Input is assumed UTF-8 + NFC. NFD (decomposed) Hangul breaks choseong extraction.
 
@@ -61,7 +62,7 @@ All (token, document) pairs go into two corpus-wide [binary fuse filters](https:
 - Exactly 3 memory probes per lookup; fingerprints are bit-packed (any width 8–16, self-described by the blob header)
 - Exact membership only: no enumeration, no deletion, no prefix queries
 
-Until v1.3 every document had its own 8-bit filter. That wastes space at per-document scale: the fuse size factor is ~1.45× at a few hundred keys versus ~1.15× at corpus scale, plus a 28-byte header per document and per-segment rounding. Merging everything into one global filter (keying each entry as `pairKey(doc_id, token_key)` — the doc id mixed through splitmix64, XORed with the token key) cut the filter section by ~29%, and that saving was reinvested into wider fingerprints: same transfer size, half the false positives, and a near-exact hi tier.
+Until v0.1.3 every document had its own 8-bit filter. That wastes space at per-document scale: the fuse size factor is ~1.45× at a few hundred keys versus ~1.15× at corpus scale, plus a 28-byte header per document and per-segment rounding. Merging everything into one global filter (keying each entry as `pairKey(doc_id, token_key)` — the doc id mixed through splitmix64, XORed with the token key) cut the filter section by ~29%, and that saving was reinvested into wider fingerprints: same transfer size, half the false positives, and a near-exact hi tier.
 
 Three independent hash layers:
 
@@ -97,12 +98,11 @@ OR semantics means every token gives every document an independent ~0.2% false-p
 `chaza.wasm` is a plain valid WASM module. The CLI's wasm patcher (`src/wasm_patch.zig`) rewrites the pre-built runtime module section by section, recomputing the LEB128 length headers:
 
 - **memory section**: initial pages extended so the index region fits inside initial memory
-- **data section**: one active data segment at the old memory end (page-aligned) carrying the index bytes
-- **data section**: two active segments added — a metadata segment (8 bytes: index ptr+len LE) written to the runtime's `g_embedded_index` slot, and an index segment carrying the index bytes at the old memory end
+- **data section**: two active segments added — a metadata segment (8 bytes: index ptr+len LE) written to the runtime's `g_embedded_index` slot, and an index segment carrying the index bytes at the old memory end (page-aligned)
 
 The loader instantiates the module — `WebAssembly.instantiateStreaming` works when the server returns `application/wasm`, so compilation overlaps the download — reads the metadata slot via `meta_fields()`, and calls `search()`. The runtime self-initializes the `IndexView` from the embedded metadata; no `set_index` call or index copy happens at load time. The query buffer is runtime-owned (`prepare_query`), so JS no longer manages allocation policy. Memory growth never moves wasm linear memory, so the index region stays valid.
 
-The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`, with filter-data holding the two global blobs as `[lo_len][hi_len][lo][hi]`) that the runtime reads zero-parse via pointer casts. See [SPEC.md](../SPEC.md) for field-level detail.
+The index itself is a flat, 4-byte-aligned, little-endian layout (`[header][meta-names][doc-table][string-pool][filter-data]`, with filter-data holding the two global blobs as `[lo_len][hi_len][lo][hi]`) that the runtime reads zero-parse via pointer casts.
 
 ## Practical size limits
 

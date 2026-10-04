@@ -1,6 +1,6 @@
 # Chaza 작동 원리
 
-인덱스·필터·검색 런타임의 내부 구조. 사용법은 [README](../README.ko.md), 포맷 전체 명세는 [SPEC.md](../SPEC.md) 참고.
+인덱스·필터·검색 런타임의 내부 구조. 사용법은 [README](../README.ko.md) 참고.
 
 ## 아키텍처
 
@@ -28,7 +28,8 @@ chaza.json  ─┤                            │
 4. 문서별 중복 제거
 5. `choseong_search`가 켜져 있으면 초성 접두 토큰 추가 (마커 `\x01`, 길이 2~`choseong_max_len`; title 단어는 길이 1부터)
 6. `prefix_fields` 소속 단어는 edge n-gram 접두 토큰 추가 (마커 `\x02`, 첫 2~8 코드포인트, 진부분 prefix만)
-7. 다시 중복 제거
+7. title 필드 토큰(과 그 초성 토큰)은 `\x03` 마커 사본으로 한 번 더 색인 — title 랭킹 신호 (아래 참고)
+8. 다시 중복 제거
 
 입력은 UTF-8 + NFC 전제. NFD(조합형) 한글은 초성 추출이 깨집니다.
 
@@ -61,7 +62,7 @@ title 필드의 토큰(과 그 초성 토큰)은 `\x03` 마커를 붙여 한 번
 - 조회당 정확히 3회 메모리 접근; 지문은 비트팩 저장 (폭 8~16, blob 헤더가 자기서술)
 - exact membership 전용: 열거·삭제·prefix 조회 불가
 
-v1.3까지는 문서마다 8비트 필터를 따로 만들었습니다. 문서 단위 규모에선 공간 낭비가 큽니다: fuse 크기 계수가 키 수백 개에선 ~1.45×인 반면 코퍼스 규모에선 ~1.15×이고, 문서당 28바이트 헤더와 세그먼트 반올림도 붙습니다. 전부 전역 필터 하나로 합치면서(엔트리 키 = `pairKey(doc_id, token_key)` — doc id를 splitmix64로 믹스해 토큰 키와 XOR) 필터 구역이 ~29% 줄었고, 그 절감분을 지문 폭에 재투자했습니다: 전송량은 그대로, 오탐은 절반, hi 계층은 사실상 정확 판정.
+v0.1.3까지는 문서마다 8비트 필터를 따로 만들었습니다. 문서 단위 규모에선 공간 낭비가 큽니다: fuse 크기 계수가 키 수백 개에선 ~1.45×인 반면 코퍼스 규모에선 ~1.15×이고, 문서당 28바이트 헤더와 세그먼트 반올림도 붙습니다. 전부 전역 필터 하나로 합치면서(엔트리 키 = `pairKey(doc_id, token_key)` — doc id를 splitmix64로 믹스해 토큰 키와 XOR) 필터 구역이 ~29% 줄었고, 그 절감분을 지문 폭에 재투자했습니다: 전송량은 그대로, 오탐은 절반, hi 계층은 사실상 정확 판정.
 
 독립된 세 해시 층:
 
@@ -97,12 +98,11 @@ OR 의미론에서는 토큰마다 모든 문서가 독립적으로 ~0.2% 오탐
 `chaza.wasm`은 유효한 순수 WASM 모듈입니다. CLI의 wasm 패처(`src/wasm_patch.zig`)가 미리 빌드된 런타임 모듈을 섹션 단위로 재작성하며 LEB128 길이 헤더를 다시 계산합니다:
 
 - **memory 섹션**: 인덱스 영역이 초기 메모리 안에 들어가도록 초기 페이지 수 확장
-- **data 섹션**: 기존 메모리 끝(페이지 정렬)에 인덱스 바이트를 담은 active 데이터 세그먼트 1개 추가
-- **데이터 섹션**: active 세그먼트 2개 추가 — 런타임의 `g_embedded_index` 슬롯에 기록되는 메타데이터 세그먼트(8바이트: 인덱스 ptr+len LE)와, 옛 메모리 끝에 인덱스 바이트를 실은 인덱스 세그먼트
+- **data 섹션**: active 세그먼트 2개 추가 — 런타임의 `g_embedded_index` 슬롯에 기록되는 메타데이터 세그먼트(8바이트: 인덱스 ptr+len LE)와, 옛 메모리 끝(페이지 정렬)에 인덱스 바이트를 실은 인덱스 세그먼트
 
 로더는 모듈을 인스턴스화하고 — 서버가 `application/wasm`을 반환하면 `WebAssembly.instantiateStreaming`이 동작하여 다운로드와 컴파일이 겹칩니다 — `meta_fields()`로 메타데이터 슬롯을 읽고 `search()`를 호출합니다. 런타임은 임베디드 메타데이터에서 `IndexView`를 자체 초기화하므로 로드 시점에 `set_index` 호출이나 인덱스 복사가 없습니다. 쿼리 버퍼는 런타임 소유(`prepare_query`)이므로 JS가 할당 정책을 관리하지 않습니다. 메모리가 늘어나도 wasm 선형 메모리는 이동하지 않으므로 인덱스 영역은 계속 유효합니다.
 
-인덱스 자체는 flat, 4바이트 정렬, little-endian 레이아웃(`[header][meta-names][doc-table][string-pool][filter-data]`, filter-data는 전역 blob 2개를 `[lo_len][hi_len][lo][hi]`로 보관)이고 런타임이 포인터 캐스트로 zero-parse로 읽습니다. 필드 단위 상세는 [SPEC.md](../SPEC.md) 참고.
+인덱스 자체는 flat, 4바이트 정렬, little-endian 레이아웃(`[header][meta-names][doc-table][string-pool][filter-data]`, filter-data는 전역 blob 2개를 `[lo_len][hi_len][lo][hi]`로 보관)이고 런타임이 포인터 캐스트로 zero-parse로 읽습니다.
 
 ## 실용적 규모 한계
 
